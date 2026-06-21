@@ -1,0 +1,57 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  # Multi-source: official kube-prometheus-stack chart + our values from Git
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: "58.4.0"
+      helm:
+        releaseName: kube-prometheus-stack
+        valueFiles:
+          - $values/monitoring/helm/values.yaml
+
+    - repoURL: "https://github.com/YOUR_ORG/churn-platform.git"
+      targetRevision: HEAD
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true   # Required for large CRDs (PrometheusRule, ServiceMonitor)
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m
+
+  ignoreDifferences:
+    # Operator rotates webhook CA bundles — don't let ArgoCD revert them
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle
+    # HPA manages Prometheus replica count during scaling tests
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/replicas

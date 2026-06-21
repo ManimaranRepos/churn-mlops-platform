@@ -1,0 +1,56 @@
+# External Secrets Operator
+# Watches ExternalSecret CRDs → fetches from AWS Secrets Manager → creates k8s Secrets
+# Flow: Pod references k8s Secret → ESO keeps it synced with Secrets Manager
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: external-secrets-sa
+  annotations:
+    eks.amazonaws.com/role-arn: ${role_arn}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Webhook validates ExternalSecret resources
+webhook:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+certController:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# Refresh interval — how often to re-sync secrets from AWS
+# 1h is a good balance: frequent enough for rotation, not hammering Secrets Manager
+global:
+  # Set this to your AWS region
+  additionalLabels:
+    app.kubernetes.io/part-of: churn-platform
+
+metrics:
+  service:
+    enabled: true
+    port: 8080
+
+serviceMonitor:
+  enabled: true
+  namespace: monitoring

@@ -1,0 +1,210 @@
+# Karpenter Node Classes and Node Pools
+# EC2NodeClass: defines WHAT kind of node to provision (AMI, security groups, etc.)
+# NodePool: defines WHO gets those nodes (which pod requirements trigger provisioning)
+
+# ── EC2NodeClass — General Workloads ──────────────────────────────────────────
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: general
+spec:
+  # Amazon Linux 2 — EKS-optimized, has AWS-specific optimizations
+  amiFamily: AL2
+  role: "churn-platform-dev-eks-node-role"  # IAM role for provisioned nodes
+
+  # Karpenter discovers subnets and security groups via these tags
+  # (set in the VPC and security group Terraform above)
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "churn-platform-dev-eks"
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "churn-platform-dev-eks"
+
+  # User data to bootstrap nodes into the EKS cluster
+  userData: |
+    #!/bin/bash
+    /etc/eks/bootstrap.sh churn-platform-dev-eks \
+      --b64-cluster-ca ${CLUSTER_CA} \
+      --apiserver-endpoint ${CLUSTER_ENDPOINT}
+
+  # EBS volume for node root filesystem
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        iops: 3000
+        encrypted: true
+        # Uses the EKS KMS key we created in Phase 1
+        kmsKeyID: "alias/churn-platform-dev-eks"
+        deleteOnTermination: true
+
+  tags:
+    Environment: dev
+    Project: churn-platform
+    ManagedBy: karpenter
+---
+# ── EC2NodeClass — GPU Training Nodes ─────────────────────────────────────────
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: gpu-training
+spec:
+  # GPU-optimized AMI — includes NVIDIA drivers, CUDA toolkit
+  amiFamily: AL2
+  role: "churn-platform-dev-eks-node-role"
+
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "churn-platform-dev-eks"
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "churn-platform-dev-eks"
+
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi  # GPU training needs more space for datasets + checkpoints
+        volumeType: gp3
+        iops: 3000
+        encrypted: true
+        kmsKeyID: "alias/churn-platform-dev-eks"
+        deleteOnTermination: true
+
+  tags:
+    Environment: dev
+    Project: churn-platform
+    NodeType: gpu-training
+    ManagedBy: karpenter
+---
+# ── NodePool — General Workloads ──────────────────────────────────────────────
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    metadata:
+      labels:
+        role: general
+        environment: dev
+    spec:
+      nodeClassRef:
+        name: general
+
+      # Which instance families Karpenter can choose from
+      # Multiple families = better Spot availability
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["m5", "m5a", "m4", "m6a", "m6i"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["large", "xlarge", "2xlarge"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+      # Nodes get this taint — pods must tolerate it to land here
+      taints:
+        - key: dedicated
+          value: general
+          effect: PreferNoSchedule
+
+  # Auto-consolidate: if a node is <50% utilized for 30 min, drain and delete it
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30m
+
+  # Safety cap: never provision more than 20 nodes in this pool
+  limits:
+    cpu: "160"    # 20 × 8 vCPU = 160 total
+    memory: 320Gi  # 20 × 16GB = 320Gi
+---
+# ── NodePool — GPU Training ───────────────────────────────────────────────────
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: gpu-training
+spec:
+  template:
+    metadata:
+      labels:
+        role: gpu-training
+    spec:
+      nodeClassRef:
+        name: gpu-training
+
+      requirements:
+        # Only Spot — training jobs tolerate interruption via checkpointing
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot"]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g4dn", "g5"]  # NVIDIA T4 and A10G GPUs
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["xlarge", "2xlarge", "4xlarge"]
+
+      taints:
+        # Strong taint — ONLY GPU training jobs land here (must have matching toleration)
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+
+  # Scale to zero when no training jobs — key cost saving for GPU (expensive nodes)
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m  # Terminate GPU node 5 min after last pod exits
+
+  limits:
+    cpu: "64"    # 4 × g4dn.4xlarge = 64 vCPU
+    memory: 256Gi
+---
+# ── NodePool — Inference ──────────────────────────────────────────────────────
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: inference
+spec:
+  template:
+    metadata:
+      labels:
+        role: inference
+    spec:
+      nodeClassRef:
+        name: general  # Reuse general node class (same AMI, different instance types)
+
+      requirements:
+        # ON_DEMAND only — inference can't tolerate 2-min eviction warnings
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c5", "c5n", "c6i"]  # Compute-optimized for inference math
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["large", "xlarge", "2xlarge"]
+
+      taints:
+        - key: dedicated
+          value: inference
+          effect: NoSchedule
+
+  disruption:
+    # Conservative — don't consolidate inference nodes aggressively
+    # A late-night lull doesn't mean traffic won't spike in 10 minutes
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 60m
+
+  limits:
+    cpu: "160"
+    memory: 320Gi

@@ -1,0 +1,99 @@
+# =============================================================================
+# ConstraintTemplate: RequireResourceLimits
+#
+# Enforces that every container in every Pod specifies resource requests AND limits
+# for both CPU and memory.
+#
+# WHY this matters in a shared EKS cluster:
+#   Without limits, a single runaway container (e.g., a training task that loads
+#   the full dataset into RAM) can exhaust node memory and OOMKill every other
+#   pod on that node — including the Airflow scheduler and inference pods.
+#   Resource limits are the single most effective way to prevent noisy-neighbour
+#   problems in a multi-tenant Kubernetes cluster.
+#
+# Exemptions (via excludedNamespaces):
+#   kube-system, kube-public, gatekeeper-system — system pods managed by AWS/Helm
+#   that we don't control. Enforcing on them would break EKS cluster upgrades.
+#
+# Applied by: k8s/gatekeeper/constraints/churn_platform_policies.yaml
+# =============================================================================
+
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requireresourcelimits
+  annotations:
+    description: "Requires all containers to specify CPU and memory requests and limits"
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireResourceLimits
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              items:
+                type: string
+              description: "Container images exempt from this constraint (e.g., init containers)"
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requireresourcelimits
+
+        import future.keywords.if
+        import future.keywords.in
+
+        # Collect all containers (regular + init + ephemeral)
+        all_containers[container] {
+          container := input.review.object.spec.containers[_]
+        }
+        all_containers[container] {
+          container := input.review.object.spec.initContainers[_]
+        }
+
+        exempt_image(image) if {
+          exempt := input.parameters.exemptImages[_]
+          startswith(image, exempt)
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt_image(container.image)
+
+          # Missing requests
+          not container.resources.requests.cpu
+          msg := sprintf(
+            "Container '%v' must specify resources.requests.cpu", [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt_image(container.image)
+          not container.resources.requests.memory
+          msg := sprintf(
+            "Container '%v' must specify resources.requests.memory", [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt_image(container.image)
+          not container.resources.limits.cpu
+          msg := sprintf(
+            "Container '%v' must specify resources.limits.cpu", [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt_image(container.image)
+          not container.resources.limits.memory
+          msg := sprintf(
+            "Container '%v' must specify resources.limits.memory", [container.name]
+          )
+        }

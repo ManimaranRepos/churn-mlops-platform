@@ -1,0 +1,37 @@
+# Metrics Server — provides CPU/memory metrics for HPA and kubectl top
+# Required for: pod autoscaling, VPA (Vertical Pod Autoscaler), capacity planning
+
+replicas: 2  # HA — HPA stops working if metrics-server is down
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 200Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+args:
+  # Needed in some EKS configurations where kubelet cert isn't from a known CA
+  - --kubelet-insecure-tls
+  - --kubelet-preferred-address-types=InternalIP
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: metrics-server
+        topologyKey: kubernetes.io/hostname
+
+metrics:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: kube-prometheus-stack

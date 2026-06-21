@@ -1,0 +1,52 @@
+# cert-manager — Automatic TLS certificate management
+# Uses Let's Encrypt for public certs, self-signed for internal services
+
+replicaCount: 2  # HA — two replicas so cert renewal survives a pod restart
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Webhook — validates Certificate/Issuer resources before they're applied
+webhook:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# cainjector — injects CA bundle into webhook configurations
+cainjector:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 256Mi
+
+# Prometheus metrics — scraped by kube-prometheus-stack
+prometheus:
+  enabled: true
+  servicemonitor:
+    enabled: true
+    namespace: monitoring
+
+# Pod anti-affinity: don't put both replicas on the same node
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cert-manager
+          topologyKey: kubernetes.io/hostname

@@ -1,0 +1,100 @@
+# =============================================================================
+# ConstraintTemplate: DisallowLatestTag
+#
+# Blocks any Pod that uses the ":latest" tag or no tag at all on a container image.
+#
+# WHY ban :latest in production?
+#   1. Non-determinism: ":latest" means "whatever is newest in the registry right now."
+#      Two identical Kubernetes deployments can pull different images on scale-out.
+#      A pod that restarts pulls a newer (potentially broken) image than its sibling.
+#
+#   2. No rollback path: if ":latest" breaks, you cannot roll back — "the previous
+#      :latest" is gone. A pinned tag (e.g., sha256:abc123) is immutable.
+#
+#   3. Supply chain risk: an attacker who compromises the registry can push a
+#      malicious ":latest" that gets silently pulled. A pinned digest or semver tag
+#      requires an explicit change to the deployment manifest, which goes through PR review.
+#
+#   In our platform, all images are built and pushed with the git SHA as the tag.
+#   This policy enforces that convention — no team member can bypass it accidentally.
+# =============================================================================
+
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: disallowlatesttag
+  annotations:
+    description: "Blocks containers using the :latest tag or no tag"
+spec:
+  crd:
+    spec:
+      names:
+        kind: DisallowLatestTag
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              items:
+                type: string
+              description: "Image prefixes exempt from this rule (e.g., debug or test images)"
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package disallowlatesttag
+
+        import future.keywords.if
+        import future.keywords.in
+
+        all_containers[container] {
+          container := input.review.object.spec.containers[_]
+        }
+        all_containers[container] {
+          container := input.review.object.spec.initContainers[_]
+        }
+
+        exempt(image) if {
+          prefix := input.parameters.exemptImages[_]
+          startswith(image, prefix)
+        }
+
+        # Extract the tag from the image string
+        # Image formats: "repo/name:tag", "repo/name", "repo/name:latest"
+        has_latest_tag(image) if {
+          endswith(image, ":latest")
+        }
+
+        has_no_tag(image) if {
+          # No colon at all = implicit :latest
+          not contains(image, ":")
+        }
+
+        has_no_tag(image) if {
+          # Colon present but only for port in registry host (e.g., registry:5000/image)
+          parts := split(image, "/")
+          count(parts) > 1
+          last_part := parts[count(parts) - 1]
+          not contains(last_part, ":")
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt(container.image)
+          has_latest_tag(container.image)
+          msg := sprintf(
+            "Container '%v' uses the ':latest' tag (image: %v). Use a pinned tag or SHA digest.",
+            [container.name, container.image]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := all_containers[_]
+          not exempt(container.image)
+          has_no_tag(container.image)
+          msg := sprintf(
+            "Container '%v' has no image tag (image: %v). Specify an explicit tag or SHA digest.",
+            [container.name, container.image]
+          )
+        }

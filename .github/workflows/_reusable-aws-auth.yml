@@ -1,0 +1,67 @@
+# =============================================================================
+# REUSABLE WORKFLOW — AWS OIDC Authentication
+# =============================================================================
+# Called by all other workflows via `uses: ./.github/workflows/_reusable-aws-auth.yml`
+# Provides temporary AWS credentials via OIDC — no stored access keys anywhere.
+#
+# How OIDC works:
+#   1. GitHub generates a signed JWT token for the job
+#   2. AWS validates it against the GitHub OIDC provider (registered in Phase 1 IAM)
+#   3. AWS returns short-lived credentials (valid for 1 hour max)
+#   4. Credentials are injected as environment variables automatically
+# =============================================================================
+
+name: Reusable — AWS Auth
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: "AWS region to authenticate against"
+        type: string
+        default: "us-east-1"
+      environment:
+        description: "Target environment (dev/staging/prod) — determines which role to assume"
+        type: string
+        required: true
+      role-session-name:
+        description: "Human-readable name for the assumed role session (shows in CloudTrail)"
+        type: string
+        default: "GitHubActions"
+    outputs:
+      aws-account-id:
+        description: "AWS account ID of the authenticated session"
+        value: ${{ jobs.auth.outputs.aws-account-id }}
+
+jobs:
+  auth:
+    name: Authenticate to AWS
+    runs-on: ubuntu-latest
+    outputs:
+      aws-account-id: ${{ steps.get-account.outputs.account-id }}
+
+    # permissions: must explicitly grant id-token write for OIDC to work
+    # Without this, GitHub won't generate the OIDC token at all
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role ARN is environment-specific — dev/staging/prod each have their own
+          # This is set as a GitHub Environment secret, not a repo secret
+          role-to-assume: ${{ secrets[format('AWS_CICD_ROLE_ARN_{0}', upper(inputs.environment))] }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: ${{ inputs.role-session-name }}
+          # 3600 seconds = max session. Most jobs finish in <10 min but
+          # terraform apply on large infra can take longer
+          role-duration-seconds: 3600
+
+      - name: Get AWS account ID
+        id: get-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account-id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "Authenticated to AWS account: $ACCOUNT_ID"

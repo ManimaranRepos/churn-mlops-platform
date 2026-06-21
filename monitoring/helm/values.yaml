@@ -1,0 +1,300 @@
+# =============================================================================
+# kube-prometheus-stack values — Churn Platform
+#
+# This chart installs:
+#   - Prometheus Operator (manages Prometheus/AlertManager as CRDs)
+#   - Prometheus (metrics store, 15-day retention on gp3 EBS)
+#   - AlertManager (routes alerts to Slack/PagerDuty via SNS Lambda)
+#   - Grafana (dashboards — loads our JSON dashboards from ConfigMaps)
+#   - node-exporter (per-node CPU/mem/disk)
+#   - kube-state-metrics (Deployment replica counts, Pod restart counts, etc.)
+#
+# WHY self-hosted Prometheus (not Amazon Managed Prometheus)?
+#   AMP costs ~$0.90/GB ingested + $0.03/GB stored/month.
+#   At our POC metric volume (~5k series), self-hosted gp3 EBS is ~90% cheaper.
+#   AMP becomes cost-effective at >100k series or when you need cross-account
+#   federation. We keep the option open by using standard PromQL — migration
+#   is a target URL change.
+# =============================================================================
+
+# ── Global ────────────────────────────────────────────────────────────────────
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    # Scrape all ServiceMonitors in the cluster (not just in monitoring namespace)
+    # WHY: Our ServiceMonitors are in 'inference' and 'airflow' namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector: {}
+
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    podMonitorSelector: {}
+
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    ruleSelector: {}
+
+    # 15-day retention — enough for monthly trend analysis without large storage
+    retention: 15d
+    retentionSize: "40GB"
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+    # Scrape interval: 30s is the standard for infrastructure metrics.
+    # WHY not 15s? At 15s with our series count, storage grows 2x and CPU
+    # for TSDB compaction doubles. 30s is sufficient for alerting SLOs.
+    scrapeInterval: "30s"
+    evaluationInterval: "30s"
+
+    # External labels appear on all metrics — useful when federating to AMP later
+    externalLabels:
+      cluster: churn-platform
+      environment: ""   # Overridden per-environment via Helm --set
+
+    # Remote write to Amazon Managed Prometheus (optional — uncomment to enable)
+    # remoteWrite:
+    #   - url: "https://aps-workspaces.us-east-1.amazonaws.com/workspaces/<id>/api/v1/remote_write"
+    #     sigv4:
+    #       region: us-east-1
+    #     queueConfig:
+    #       maxSamplesPerSend: 1000
+    #       maxShards: 200
+    #       capacity: 2500
+
+    # PodAntiAffinity: spread Prometheus across AZs if running 2 replicas
+    podAntiAffinity: "soft"
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+
+  # Service for Grafana to query
+  service:
+    port: 9090
+
+# ── AlertManager ──────────────────────────────────────────────────────────────
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+  config:
+    global:
+      # How long AlertManager waits before sending a re-notification for a firing alert
+      resolve_timeout: 5m
+
+    route:
+      group_by: ["alertname", "severity", "namespace"]
+      group_wait: 30s          # Wait 30s to batch alerts before first notification
+      group_interval: 5m       # Wait 5m before sending updates on existing groups
+      repeat_interval: 4h      # Re-notify every 4h if alert is still firing
+      receiver: "slack-warnings"
+
+      routes:
+        # Critical alerts (model down, inference 5xx > 10%) → immediate Slack + PagerDuty
+        - matchers:
+            - name: severity
+              value: critical
+          receiver: "slack-critical"
+          group_wait: 10s
+          repeat_interval: 1h
+
+        # Warnings (high latency, data quality issues) → Slack warnings channel
+        - matchers:
+            - name: severity
+              value: warning
+          receiver: "slack-warnings"
+
+        # Info alerts (successful model promotions, pipeline completions) → log only
+        - matchers:
+            - name: severity
+              value: info
+          receiver: "slack-info"
+
+    receivers:
+      # SNS webhook → Lambda → Slack (Lambda added in Phase 8 Terraform)
+      # WHY SNS in between (not direct webhook)?
+      #   AlertManager webhook receivers need a public HTTPS endpoint.
+      #   The SNS → Lambda path keeps the Lambda inside the VPC and uses
+      #   AWS IAM for authentication instead of exposing a webhook URL.
+      #   Alternative: use the alertmanager-sns-forwarder sidecar.
+      - name: "slack-critical"
+        webhook_configs:
+          - url: "http://alertmanager-sns-forwarder:9087/alert/critical"
+            send_resolved: true
+
+      - name: "slack-warnings"
+        webhook_configs:
+          - url: "http://alertmanager-sns-forwarder:9087/alert/warning"
+            send_resolved: true
+
+      - name: "slack-info"
+        webhook_configs:
+          - url: "http://alertmanager-sns-forwarder:9087/alert/info"
+            send_resolved: false   # Don't spam for resolved info events
+
+    # Inhibit rules: suppress child alerts when parent is firing
+    inhibit_rules:
+      # If the inference deployment is down (critical), suppress its latency warnings
+      - source_matchers:
+          - name: alertname
+            value: InferencePodCrashLooping
+        target_matchers:
+          - name: alertname
+            value: InferenceHighLatency
+        equal: ["namespace"]
+
+# ── Grafana ───────────────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  adminPassword: ""    # Set via --set or ExternalSecret; never hardcoded
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 5Gi
+
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+
+  # Load our dashboard JSONs from ConfigMaps (created in monitoring/dashboards/)
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard         # Sidecar watches ConfigMaps with this label
+      labelValue: "1"
+      searchNamespace: ALL             # Look in all namespaces
+
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+
+  # Grafana plugins — installed at startup
+  plugins:
+    - grafana-piechart-panel
+    - grafana-clock-panel
+
+  grafana.ini:
+    server:
+      root_url: ""    # Set to your actual Grafana URL in prod
+    auth:
+      disable_login_form: false
+    security:
+      allow_embedding: false
+      cookie_secure: true
+    users:
+      default_theme: dark
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+
+  # Ingress for Grafana UI
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/group.name: churn-platform
+    hosts:
+      - grafana.internal.churn-platform.example.com
+
+  # Additional datasources — CloudWatch for AWS metrics alongside Prometheus
+  additionalDataSources:
+    - name: CloudWatch
+      type: cloudwatch
+      jsonData:
+        defaultRegion: us-east-1
+        authType: default    # Uses the Grafana pod's IRSA role
+
+# ── node-exporter ─────────────────────────────────────────────────────────────
+nodeExporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# ── kube-state-metrics ────────────────────────────────────────────────────────
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# ── Prometheus Operator ───────────────────────────────────────────────────────
+prometheusOperator:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+  # Admission webhooks validate PrometheusRule/ServiceMonitor CRDs before apply
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+
+# ── Default alerting rules ────────────────────────────────────────────────────
+# The chart ships with node/pod/k8s rules. We add our custom rules via
+# a separate PrometheusRule CRD in monitoring/alerts/churn_rules.yaml.
+# Disable the default etcd rules (we don't expose etcd metrics on EKS):
+defaultRules:
+  rules:
+    etcd: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false

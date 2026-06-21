@@ -1,0 +1,55 @@
+# AWS Load Balancer Controller
+# Translates Kubernetes Ingress → Application Load Balancer (ALB)
+# Translates Service type:LoadBalancer → Network Load Balancer (NLB)
+
+clusterName: ${cluster_name}  # Injected by Terraform templatefile()
+
+replicaCount: 2  # HA — ALB controller must be up to create/update load balancers
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+  annotations:
+    # IRSA — this service account assumes the ALB controller IAM role
+    eks.amazonaws.com/role-arn: ${role_arn}
+
+region: ${aws_region}
+vpcId: ${vpc_id}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Only watch Ingress/Service resources with this annotation
+# Prevents the controller from claiming every Ingress in the cluster
+ingressClass: alb
+
+# Enable WAF and Shield integration for production security
+enableWaf: true
+enableWafv2: true
+enableShield: false  # Shield Advanced costs $3000/month — enable only in prod
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: aws-load-balancer-controller
+        topologyKey: kubernetes.io/hostname
+
+# Schedule on general nodes (not inference-dedicated nodes)
+nodeSelector:
+  role: general
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "general"
+    effect: "PreferNoSchedule"

@@ -1,0 +1,9 @@
+mlflow==2.11.1
+psycopg2-binary==2.9.9     # PostgreSQL driver (Aurora backend)
+boto3==1.34.0              # S3 artifact store + Secrets Manager
+botocore==1.34.0
+sqlalchemy==2.0.28         # ORM for MLflow metadata DB
+alembic==1.13.1            # DB migrations
+gunicorn==21.2.0           # Production WSGI server
+prometheus-client==0.20.0  # Expose /metrics for Prometheus scraping
+cryptography==42.0.5       # TLS support

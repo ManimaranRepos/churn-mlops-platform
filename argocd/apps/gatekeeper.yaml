@@ -1,0 +1,107 @@
+# =============================================================================
+# ArgoCD Application — OPA Gatekeeper
+#
+# Two sources:
+#   1. Official Gatekeeper Helm chart (installs the operator + webhook)
+#   2. Our Git repo (deploys ConstraintTemplates + Constraints)
+#
+# WHY deploy Gatekeeper before constraints?
+#   Gatekeeper's webhook must be registered before constraints can be applied.
+#   ArgoCD's sync waves handle this:
+#     Wave 1: Gatekeeper operator (installs the CRDs and webhook)
+#     Wave 2: ConstraintTemplates (registers the policy schema)
+#     Wave 3: Constraints (activates the policies)
+#
+# The ArgoCD ignoreDifferences for webhook caBundle is critical:
+#   Gatekeeper rotates its own webhook TLS certificate. Each rotation updates
+#   the caBundle field in the MutatingWebhookConfiguration. Without this
+#   ignoreDifferences, ArgoCD would revert the rotated cert and break admission.
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gatekeeper
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"   # Deploy before workload applications
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  sources:
+    # Source 1: Official Gatekeeper Helm chart
+    - repoURL: https://open-policy-agent.github.io/gatekeeper/charts
+      chart: gatekeeper
+      targetRevision: "3.15.1"
+      helm:
+        releaseName: gatekeeper
+        values: |
+          replicaCount: 2
+          auditInterval: 300          # Audit existing resources every 5 min
+          constraintViolationsLimit: 20
+          image:
+            pullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          # Exempt namespaces from the webhook (system + argocd itself)
+          exemptNamespaces:
+            - kube-system
+            - kube-public
+            - gatekeeper-system
+            - cert-manager
+            - external-secrets
+            - argocd
+          controllerManager:
+            podSecurityContext:
+              runAsNonRoot: true
+              fsGroup: 65532
+          audit:
+            podSecurityContext:
+              runAsNonRoot: true
+
+    # Source 2: Our constraint templates and constraints from Git
+    - repoURL: "https://github.com/YOUR_ORG/churn-platform.git"
+      targetRevision: HEAD
+      path: k8s/gatekeeper
+      # Sync wave 1: templates before constraints
+      # Individual resources use sync-wave annotations in their YAML
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gatekeeper-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true       # Required for Gatekeeper CRDs (large schemas)
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    # Gatekeeper rotates its own webhook TLS cert — don't revert it
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      name: gatekeeper-mutating-webhook-configuration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle
+        - /webhooks/1/clientConfig/caBundle
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      name: gatekeeper-validating-webhook-configuration
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle

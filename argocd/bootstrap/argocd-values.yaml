@@ -1,0 +1,152 @@
+# ArgoCD Helm values
+# Deployed once via: helm install argocd argo/argo-cd -n argocd -f this-file.yaml
+# After this, ArgoCD manages itself via GitOps (including its own config updates)
+
+global:
+  image:
+    tag: "v2.10.1"
+
+# ── Server ──────────────────────────────────────────────────────────────────
+server:
+  replicas: 2  # HA — ArgoCD server must be up for CLI and UI access
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Expose ArgoCD UI via ALB (created by aws-load-balancer-controller)
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal  # Internal — access via VPN only
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/backend-protocol: HTTPS
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_ACM_CERT_ARN"
+    hosts:
+      - argocd.internal.churn-platform.dev
+    tls:
+      - secretName: argocd-tls
+
+  # Don't redirect HTTP to HTTPS at ArgoCD level — ALB handles TLS termination
+  extraArgs:
+    - --insecure  # ArgoCD runs plain HTTP; ALB does TLS termination upstream
+
+# ── Application Controller ───────────────────────────────────────────────────
+controller:
+  replicas: 1  # Only one controller can hold the leader lease at a time
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  # How often ArgoCD polls Git for changes
+  # 3m is the default — fine for most workflows; CI triggers explicit syncs anyway
+  env:
+    - name: ARGOCD_RECONCILIATION_TIMEOUT
+      value: "180s"
+
+# ── Repo Server ───────────────────────────────────────────────────────────────
+repoServer:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Install Helm plugins for decryption and Kustomize
+  env:
+    - name: HELM_PLUGINS
+      value: /custom-tools/helm-plugins
+
+# ── Application Set Controller ───────────────────────────────────────────────
+# Generates multiple Application objects from a template (e.g., one per environment)
+applicationSet:
+  enabled: true
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# ── Redis (ArgoCD internal cache) ─────────────────────────────────────────────
+redis:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ── RBAC ─────────────────────────────────────────────────────────────────────
+configs:
+  rbac:
+    # policy.csv defines who can do what in ArgoCD
+    # Admin: full control
+    # Developer: sync apps, view everything, cannot delete apps
+    # Readonly: view only
+    policy.csv: |
+      p, role:admin, *, *, */*, allow
+      p, role:developer, applications, sync, */*, allow
+      p, role:developer, applications, get, */*, allow
+      p, role:developer, logs, get, */*, allow
+      p, role:readonly, *, get, */*, allow
+      g, mlops-admins, role:admin
+      g, data-scientists, role:developer
+      g, stakeholders, role:readonly
+    policy.default: role:readonly
+
+  # ArgoCD uses these to authenticate users via GitHub SSO
+  # Configure in GitHub: Settings → OAuth Apps → New OAuth App
+  secret:
+    argocdServerAdminPassword: "${{ ARGOCD_ADMIN_PASSWORD_BCRYPT }}"  # Set via sealed secret
+
+  # Repository credentials — ArgoCD needs to clone your Git repo
+  repositories:
+    - url: https://github.com/your-org/churn-platform
+      type: git
+      passwordSecret:
+        name: github-credentials
+        key: password
+      usernameSecret:
+        name: github-credentials
+        key: username
+
+  # Helm chart repositories used by ArgoCD Applications
+  helm:
+    repositories:
+      - name: argo
+        url: https://argoproj.github.io/argo-helm
+      - name: aws-eks
+        url: https://aws.github.io/eks-charts
+      - name: jetstack
+        url: https://charts.jetstack.io
+
+# Pod anti-affinity across all ArgoCD components
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: argocd
+          topologyKey: kubernetes.io/hostname

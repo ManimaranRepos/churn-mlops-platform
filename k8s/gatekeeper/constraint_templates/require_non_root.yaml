@@ -1,0 +1,90 @@
+# =============================================================================
+# ConstraintTemplate: RequireNonRoot
+#
+# Blocks any Pod that runs as root (UID 0) or does not explicitly set
+# runAsNonRoot: true in its security context.
+#
+# WHY non-root matters:
+#   If a container runs as root and an attacker exploits a vulnerability in the
+#   application (e.g., RCE via a dependency), they get root inside the container.
+#   With a container escape vulnerability (rare but real), root-in-container
+#   can become root-on-node — full node compromise. Non-root significantly
+#   raises the bar: the attacker must chain root-in-container + privilege escalation.
+#
+#   In our platform:
+#     - inference/Dockerfile: USER inference (UID 1000) ✓
+#     - airflow/Dockerfile: USER airflow (UID 50000) ✓
+#     - ml/training/Dockerfile: USER training (UID 1000) ✓
+#   All our images are already non-root. This policy makes it permanent —
+#   a future developer cannot accidentally push a root container.
+# =============================================================================
+
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requirenonroot
+  annotations:
+    description: "Requires containers to run as non-root users"
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireNonRoot
+      validation:
+        openAPIV3Schema:
+          type: object
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requirenonroot
+
+        import future.keywords.if
+
+        # Check Pod-level security context
+        pod_runs_as_root if {
+          input.review.object.spec.securityContext.runAsUser == 0
+        }
+
+        pod_runs_as_root if {
+          input.review.object.spec.securityContext.runAsNonRoot == false
+        }
+
+        # If neither runAsUser nor runAsNonRoot is set at pod level,
+        # check at the container level
+        container_missing_nonroot(container) if {
+          not container.securityContext.runAsNonRoot
+          not container.securityContext.runAsUser
+          not input.review.object.spec.securityContext.runAsNonRoot
+          not input.review.object.spec.securityContext.runAsUser
+        }
+
+        container_is_root(container) if {
+          container.securityContext.runAsUser == 0
+        }
+
+        container_is_root(container) if {
+          container.securityContext.runAsNonRoot == false
+        }
+
+        violation[{"msg": msg}] {
+          pod_runs_as_root
+          msg := "Pod security context sets runAsUser=0 or runAsNonRoot=false — must run as non-root"
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container_is_root(container)
+          msg := sprintf(
+            "Container '%v' runs as root (runAsUser=0 or runAsNonRoot=false)", [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container_missing_nonroot(container)
+          msg := sprintf(
+            "Container '%v' must set securityContext.runAsNonRoot: true or a non-zero runAsUser",
+            [container.name]
+          )
+        }

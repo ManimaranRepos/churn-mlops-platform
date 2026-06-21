@@ -1,0 +1,105 @@
+# Resource Quotas — prevent any one team or workload from consuming all cluster resources
+# Without these, a runaway training job could starve inference services of CPU/memory
+
+# ── MLOps namespace ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: mlops-quota
+  namespace: mlops
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "50"
+    persistentvolumeclaims: "20"
+---
+# ── Data Engineering namespace ─────────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: data-engineering-quota
+  namespace: data-engineering
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "30"
+---
+# ── Inference namespace ────────────────────────────────────────────────────────
+# Higher limits — inference scales horizontally under load
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: inference-quota
+  namespace: inference
+spec:
+  hard:
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.cpu: "80"
+    limits.memory: 160Gi
+    pods: "100"
+---
+# ── Airflow namespace ──────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: airflow-quota
+  namespace: airflow
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "60"
+---
+# ── LimitRange — default requests/limits for pods that don't specify them ──────
+# Without LimitRange, a pod without resource requests gets 0 guaranteed resources
+# and can be evicted under pressure. This protects against careless pod specs.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: mlops
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: inference
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 1Gi
+      defaultRequest:
+        cpu: 200m
+        memory: 256Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      min:
+        cpu: 100m
+        memory: 128Mi

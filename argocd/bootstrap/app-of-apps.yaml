@@ -1,0 +1,58 @@
+# =============================================================================
+# ROOT APPLICATION — App-of-Apps Pattern
+# =============================================================================
+# This is the ONE manifest you apply manually (once).
+# It tells ArgoCD to watch argocd/apps/ and create Application objects
+# for every file it finds there. Adding a new service = add one file.
+#
+# Apply with:
+#   kubectl apply -f argocd/bootstrap/app-of-apps.yaml -n argocd
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: argocd
+  # Finalizer ensures ArgoCD cleans up all child apps when this is deleted
+  # Without this, deleting the root app leaves orphaned running applications
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: churn-platform
+    tier: platform
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/churn-platform
+    targetRevision: HEAD
+    # ArgoCD watches this directory for Application manifests
+    path: argocd/apps
+
+  destination:
+    server: https://kubernetes.default.svc  # Deploy to the local cluster
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # prune: delete resources from cluster when removed from Git
+      prune: true
+      # selfHeal: if someone kubectl-applies something manually, ArgoCD reverts it
+      # This enforces Git as the single source of truth
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Health check: app-of-apps is healthy only when all child apps are healthy
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Application
+      jsonPointers:
+        - /status  # Don't track status field changes

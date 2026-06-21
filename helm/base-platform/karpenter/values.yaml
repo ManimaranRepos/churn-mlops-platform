@@ -1,0 +1,60 @@
+# Karpenter — Just-in-time node provisioner
+# Unlike Cluster Autoscaler (which scales ASGs), Karpenter directly launches EC2 instances.
+# This means it can provision exactly the right instance type in <60 seconds.
+
+serviceAccount:
+  create: true
+  name: karpenter
+  annotations:
+    eks.amazonaws.com/role-arn: ${role_arn}
+
+settings:
+  clusterName: ${cluster_name}
+  clusterEndpoint: ${cluster_endpoint}
+  # SQS queue for Spot interruption events — Karpenter drains nodes proactively
+  interruptionQueue: ${interruption_queue}
+  # How aggressively to consolidate nodes (remove underutilized nodes)
+  # WhenUnderutilized: consolidate when node resource usage < 50%
+  featureGates:
+    drift: true  # Detect when nodes drift from desired spec and replace them
+
+replicas: 2  # HA controller
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: role
+              operator: In
+              values: ["general"]
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: karpenter
+        topologyKey: kubernetes.io/hostname
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "general"
+    effect: "PreferNoSchedule"
+
+metrics:
+  port: 8000
+
+serviceMonitor:
+  enabled: true
+  namespace: monitoring

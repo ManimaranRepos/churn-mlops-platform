@@ -1,0 +1,118 @@
+{
+  "_comment": "SageMaker Hyperparameter Tuning Job configuration for XGBoost churn model. WHY HPO: manual grid search is O(n^m) for n values and m params. Bayesian optimisation finds a good point in ~20 trials vs hundreds for grid search, by building a surrogate model of which hyperparameter regions give good results.",
+
+  "xgboost": {
+    "strategy": "Bayesian",
+    "max_jobs": 20,
+    "max_parallel_jobs": 4,
+    "objective_metric": {
+      "name": "val:auc",
+      "type": "Maximize"
+    },
+    "parameter_ranges": {
+      "continuous": [
+        {
+          "name": "learning_rate",
+          "min_value": "0.01",
+          "max_value": "0.3",
+          "scaling_type": "Logarithmic"
+        },
+        {
+          "name": "gamma",
+          "min_value": "0.0",
+          "max_value": "5.0",
+          "scaling_type": "Linear"
+        },
+        {
+          "name": "subsample",
+          "min_value": "0.5",
+          "max_value": "1.0",
+          "scaling_type": "Linear"
+        },
+        {
+          "name": "colsample_bytree",
+          "min_value": "0.5",
+          "max_value": "1.0",
+          "scaling_type": "Linear"
+        }
+      ],
+      "integer": [
+        {
+          "name": "max_depth",
+          "min_value": "3",
+          "max_value": "10",
+          "scaling_type": "Linear"
+        },
+        {
+          "name": "min_child_weight",
+          "min_value": "1",
+          "max_value": "20",
+          "scaling_type": "Linear"
+        },
+        {
+          "name": "n_estimators",
+          "min_value": "100",
+          "max_value": "1000",
+          "scaling_type": "Logarithmic"
+        }
+      ]
+    },
+    "warmstart": {
+      "enabled": true,
+      "warmstart_type": "IDENTICAL_DATA_AND_ALGORITHM",
+      "_comment": "Warm start reuses results from previous HPO jobs with the same dataset. Saves 40-60% of HPO cost when tuning iteratively."
+    }
+  },
+
+  "pytorch": {
+    "strategy": "Bayesian",
+    "max_jobs": 15,
+    "max_parallel_jobs": 3,
+    "objective_metric": {
+      "name": "val:auc",
+      "type": "Maximize"
+    },
+    "parameter_ranges": {
+      "continuous": [
+        {
+          "name": "learning_rate",
+          "min_value": "0.0001",
+          "max_value": "0.01",
+          "scaling_type": "Logarithmic"
+        },
+        {
+          "name": "weight_decay",
+          "min_value": "0.00001",
+          "max_value": "0.01",
+          "scaling_type": "Logarithmic"
+        },
+        {
+          "name": "dropout_rate",
+          "min_value": "0.1",
+          "max_value": "0.5",
+          "scaling_type": "Linear"
+        },
+        {
+          "name": "focal_gamma",
+          "min_value": "0.5",
+          "max_value": "5.0",
+          "scaling_type": "Linear"
+        }
+      ],
+      "integer": [
+        {
+          "name": "batch_size",
+          "min_value": "128",
+          "max_value": "1024",
+          "scaling_type": "Logarithmic"
+        }
+      ],
+      "categorical": [
+        {
+          "name": "hidden_dims",
+          "values": ["128,64", "256,128", "256,128,64", "512,256,128", "512,256,128,64"]
+        }
+      ]
+    }
+  }
+}

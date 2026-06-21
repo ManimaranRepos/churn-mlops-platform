@@ -1,0 +1,94 @@
+# =============================================================================
+# ServiceMonitor CRDs — tell Prometheus Operator which pods to scrape
+#
+# WHY ServiceMonitor (not annotation-based scraping)?
+#   kube-prometheus-stack uses operator-based discovery by default.
+#   Annotation-based scraping (prometheus.io/scrape=true) requires enabling
+#   the kubernetes_sd_configs scraper manually — more config, less structured.
+#   ServiceMonitor is the recommended pattern and supports relabeling,
+#   per-target TLS, and bearer token auth out of the box.
+# =============================================================================
+
+---
+# ServiceMonitor: FastAPI inference pods
+# Scrapes the /metrics endpoint we built in inference/src/main.py
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: churn-inference
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - inference
+  selector:
+    matchLabels:
+      app: churn-inference
+  endpoints:
+    - port: http        # Must match the service port name in inference/helm/values.yaml
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      # Add environment label to all metrics from this target
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+
+---
+# ServiceMonitor: Airflow statsd-exporter sidecar
+# The Airflow Helm chart ships a statsd sidecar that converts Airflow metrics
+# to Prometheus format. We scrape it on port 9102 (default statsd-exporter port).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: airflow-statsd
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - airflow
+  selector:
+    matchLabels:
+      component: statsd
+  endpoints:
+    - port: statsd-scrape    # Port name in Airflow Helm chart's statsd service
+      path: /metrics
+      interval: 30s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+
+---
+# ServiceMonitor: MLflow tracking server
+# MLflow exposes basic metrics at /metrics if prometheus-flask-exporter is installed.
+# We expose request latency, active run counts, and experiment counts.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mlflow
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - mlflow
+  selector:
+    matchLabels:
+      app: mlflow
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 60s     # MLflow metrics change slowly — 60s is sufficient
+      scrapeTimeout: 15s

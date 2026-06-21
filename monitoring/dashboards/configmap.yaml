@@ -1,0 +1,27 @@
+# =============================================================================
+# Grafana Dashboard ConfigMap
+#
+# The Grafana sidecar (grafana-sc-dashboard) watches for ConfigMaps with
+# label grafana_dashboard=1 across all namespaces and auto-loads the JSON.
+#
+# WHY store dashboards in Git (not in Grafana's database)?
+#   - Dashboards in the Grafana DB are lost when the PVC is recreated.
+#   - Git history gives you dashboard versioning and PR review for changes.
+#   - Multiple clusters (dev/staging/prod) stay in sync automatically.
+#   - The sidecar polls for ConfigMap changes every 60s — no Grafana restart needed.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: churn-platform-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"    # Triggers the grafana sidecar to load this dashboard
+data:
+  churn_platform.json: |
+    # Contents injected by Kustomize or Helm at deploy time from:
+    #   monitoring/dashboards/churn_platform.json
+    # Use: kubectl create configmap churn-platform-dashboard \
+    #        --from-file=churn_platform.json=monitoring/dashboards/churn_platform.json \
+    #        -n monitoring --dry-run=client -o yaml | kubectl apply -f -

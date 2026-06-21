@@ -1,0 +1,148 @@
+# =============================================================================
+# AlertManager SNS Forwarder
+#
+# Runs as a sidecar alongside AlertManager. AlertManager sends webhook POST
+# to http://alertmanager-sns-forwarder:9087/alert/{severity}, this service
+# publishes to the corresponding SNS topic.
+#
+# WHY a sidecar (not a separate Deployment)?
+#   The forwarder needs to be co-located so AlertManager can reach it via
+#   localhost/ClusterIP without going through the ingress. A sidecar in the
+#   same pod would work but kube-prometheus-stack doesn't expose pod spec
+#   injection in a clean way. A Deployment in the same namespace is simpler.
+#
+# Image: datareply/alertmanager-sns-forwarder
+#   Open-source, lightweight Go binary that translates AlertManager webhook
+#   format to SNS Publish calls using IRSA credentials.
+# =============================================================================
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-sns-forwarder
+  namespace: monitoring
+  labels:
+    app: alertmanager-sns-forwarder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager-sns-forwarder
+  template:
+    metadata:
+      labels:
+        app: alertmanager-sns-forwarder
+    spec:
+      serviceAccountName: alertmanager-sns-forwarder
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+
+      containers:
+        - name: forwarder
+          image: datareply/alertmanager-sns-forwarder:v0.2.0
+          args:
+            - "--addr=0.0.0.0:9087"
+            - "--aws-region=$(AWS_REGION)"
+            # Map severity path suffix to SNS topic ARN:
+            #   POST /alert/critical → SNS_TOPIC_ARN_CRITICAL
+            #   POST /alert/warning  → SNS_TOPIC_ARN_WARNING
+            #   POST /alert/info     → SNS_TOPIC_ARN_INFO
+            - "--sns-topic-critical=$(SNS_TOPIC_ARN_CRITICAL)"
+            - "--sns-topic-warning=$(SNS_TOPIC_ARN_WARNING)"
+            - "--sns-topic-info=$(SNS_TOPIC_ARN_INFO)"
+
+          env:
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: SNS_TOPIC_ARN_CRITICAL
+              valueFrom:
+                secretKeyRef:
+                  name: monitoring-sns-arns
+                  key: CRITICAL_ARN
+            - name: SNS_TOPIC_ARN_WARNING
+              valueFrom:
+                secretKeyRef:
+                  name: monitoring-sns-arns
+                  key: WARNING_ARN
+            - name: SNS_TOPIC_ARN_INFO
+              valueFrom:
+                secretKeyRef:
+                  name: monitoring-sns-arns
+                  key: INFO_ARN
+
+          ports:
+            - containerPort: 9087
+              name: http
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9087
+            initialDelaySeconds: 5
+            periodSeconds: 15
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-sns-forwarder
+  namespace: monitoring
+spec:
+  selector:
+    app: alertmanager-sns-forwarder
+  ports:
+    - port: 9087
+      targetPort: 9087
+      name: http
+
+---
+# ServiceAccount with IRSA annotation for SNS publish permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alertmanager-sns-forwarder
+  namespace: monitoring
+  annotations:
+    eks.amazonaws.com/role-arn: ""    # Filled at deploy time from Terraform output
+
+---
+# ExternalSecret: sync SNS topic ARNs from Secrets Manager
+# (The Terraform module stores these as a secret after creating the SNS topics)
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: monitoring-sns-arns
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: monitoring-sns-arns
+    creationPolicy: Owner
+  data:
+    - secretKey: CRITICAL_ARN
+      remoteRef:
+        key: "churn-platform/monitoring/sns-arns"
+        property: critical_arn
+    - secretKey: WARNING_ARN
+      remoteRef:
+        key: "churn-platform/monitoring/sns-arns"
+        property: warning_arn
+    - secretKey: INFO_ARN
+      remoteRef:
+        key: "churn-platform/monitoring/sns-arns"
+        property: info_arn

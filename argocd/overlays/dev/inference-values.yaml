@@ -1,0 +1,31 @@
+# Dev overlay — small footprint, spot instances, Staging model
+# image.repository and image.tag injected by GitHub Actions at deploy time
+
+env:
+  ENVIRONMENT: dev
+  MODEL_STAGE: Staging    # Dev runs against Staging model
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "1Gi"
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"
+
+autoscaling:
+  enabled: false    # Static replica in dev
+
+nodeSelector:
+  node.kubernetes.io/lifecycle: spot
+
+tolerations:
+  - key: "spot"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+
+ingress:
+  enabled: true     # Access via ALB in dev for integration testing

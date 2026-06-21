@@ -1,0 +1,306 @@
+# =============================================================================
+# PrometheusRule CRD — Custom alerting rules for the Churn Platform
+#
+# Applied by: kubectl apply -f monitoring/alerts/churn_rules.yaml
+# Or via ArgoCD sync (this file lives in Git, ArgoCD watches the namespace).
+#
+# The Prometheus Operator picks up this CRD because we set:
+#   ruleSelector: {}   (match all rules in all namespaces)
+# in values.yaml.
+#
+# Alert severity levels:
+#   critical — PagerDuty + Slack immediate (SLA breach or service down)
+#   warning  — Slack warning channel (degraded but not down)
+#   info     — Slack info channel (significant events, not failures)
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: churn-platform-rules
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack   # Must match Prometheus ruleSelector
+spec:
+  groups:
+
+    # ── Inference Service ─────────────────────────────────────────────────────
+    - name: churn.inference
+      interval: 30s
+      rules:
+
+        # Record rule: pre-compute request rate (used in dashboards for efficiency)
+        - record: churn:inference_requests:rate5m
+          expr: |
+            sum(rate(churn_api_requests_total[5m])) by (env)
+
+        - record: churn:inference_errors:rate5m
+          expr: |
+            sum(rate(churn_api_errors_total[5m])) by (env)
+
+        - record: churn:cache_hit_ratio:rate5m
+          expr: |
+            sum(rate(churn_api_cache_hits_total[5m])) by (env)
+            /
+            (sum(rate(churn_api_requests_total[5m])) by (env) > 0)
+
+        # Alert: error rate > 5% sustained for 5 minutes
+        - alert: InferenceHighErrorRate
+          expr: |
+            (
+              sum(rate(churn_api_errors_total[5m])) by (env)
+              /
+              sum(rate(churn_api_requests_total[5m])) by (env)
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "Inference API error rate > 5% (env={{ $labels.env }})"
+            description: |
+              The inference API is returning errors at {{ $value | humanizePercentage }}
+              sustained for 5 minutes. This will impact CRM integrations.
+              Runbook: https://wiki.internal/runbooks/inference-errors
+            dashboard: "https://grafana.internal/d/churn-inference"
+
+        # Alert: P99 latency > 300ms for 10 minutes
+        - alert: InferenceHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(churn_api_inference_latency_seconds_bucket[5m])) by (le, env)
+            ) > 0.3
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Inference P99 latency > 300ms (env={{ $labels.env }})"
+            description: |
+              P99 inference latency is {{ $value | humanizeDuration }}.
+              Quality gate threshold is 200ms. Check model complexity or Redis cache hit rate.
+              Dashboard: https://grafana.internal/d/churn-inference
+
+        # Alert: all inference pods down (no requests processed in 5 min despite expected traffic)
+        - alert: InferenceServiceDown
+          expr: |
+            absent(churn_api_requests_total) == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "Inference service appears to be down"
+            description: |
+              No inference metrics have been received for 5 minutes.
+              Either all pods crashed or metrics scraping is broken.
+              Check: kubectl get pods -n inference
+
+        # Alert: cache hit ratio dropped below 30% (suggests Redis is down or TTL too short)
+        - alert: InferenceLowCacheHitRatio
+          expr: |
+            churn:cache_hit_ratio:rate5m < 0.30
+          for: 15m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Inference cache hit ratio < 30% (env={{ $labels.env }})"
+            description: |
+              Cache hit ratio is {{ $value | humanizePercentage }}.
+              Low ratio means most requests are hitting the model directly, increasing latency.
+              Check Redis health: kubectl exec -n inference deploy/churn-inference -- curl /health/ready
+
+        # Alert: prediction rate deviation — possible model behaviour change
+        # WHY: if churn rate suddenly jumps from ~10% to ~40%, something is wrong
+        # (feature pipeline bug, data drift, or model regression after promotion)
+        - alert: InferencePredictionRateAnomaly
+          expr: |
+            (
+              sum(rate(churn_api_batch_requests_total[30m])) by (env)
+              / sum(rate(churn_api_requests_total[30m])) by (env)
+            ) > 0.50
+          for: 30m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Positive prediction rate anomaly detected (env={{ $labels.env }})"
+            description: |
+              More than 50% of predictions are positive (churn=true) over the last 30 minutes.
+              Expected baseline is ~10%. This may indicate a feature pipeline bug or model drift.
+
+    # ── Airflow DAG Health ────────────────────────────────────────────────────
+    - name: churn.airflow
+      interval: 60s
+      rules:
+
+        # Airflow statsd → Prometheus metrics exposed via statsd-exporter sidecar
+        # Metric names from: https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/metrics.html
+
+        # Alert: DAG run failure (catches any DAG, not just churn ones)
+        - alert: AirflowDAGFailed
+          expr: |
+            increase(airflow_dag_processing_total_parse_time[5m]) == 0
+            and on() hour() >= 3 and on() hour() <= 23
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Airflow DAG processing stalled"
+            description: |
+              Airflow scheduler has not parsed DAGs in the last 5 minutes during business hours.
+              Check: kubectl logs -n airflow -l component=scheduler
+
+        - alert: AirflowSchedulerNotRunning
+          expr: |
+            absent(airflow_scheduler_heartbeat) == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "Airflow scheduler heartbeat missing"
+            description: |
+              The Airflow scheduler has not emitted a heartbeat in 5 minutes.
+              The feature_pipeline and training_pipeline will not run.
+              Check: kubectl get pods -n airflow -l component=scheduler
+
+        # Alert: feature pipeline SLA breach (expected to complete by 04:00 UTC)
+        # This uses a CloudWatch custom metric emitted by the DAG's on_sla_miss callback,
+        # bridged to Prometheus via the CloudWatch datasource + recording rule.
+        # For a pure-Prometheus approach: use the Airflow statsd dag_run.duration metric.
+        - alert: FeaturePipelineSLABreach
+          expr: |
+            airflow_dagrun_duration_success{dag_id="churn_feature_pipeline"} > 7200
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Feature pipeline took > 2 hours to complete"
+            description: |
+              The churn_feature_pipeline DAG took {{ $value | humanizeDuration }} to complete.
+              Expected SLA is 2 hours (02:00–04:00 UTC window).
+              Long runtimes suggest Glue job capacity issues or large data volumes.
+
+    # ── Data Quality ──────────────────────────────────────────────────────────
+    - name: churn.data_quality
+      interval: 60s
+      rules:
+
+        # DataQualityIssues is emitted by the data_quality DAG's aggregate task
+        # via emit_dag_metric() → CloudWatch → Prometheus via CW datasource
+        # For a local Prometheus metric, the DAG also emits to statsd.
+        - alert: DataQualityCheckFailed
+          expr: |
+            churn_dag_metric{metric_name="DataQualityIssues"} > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Data quality check found {{ $value }} issue(s)"
+            description: |
+              The hourly data quality DAG detected issues. Check Airflow UI for details.
+              Common causes: Kinesis stream throttling, Firehose delivery failure, Glue crawler error.
+
+    # ── EKS Pod Health ────────────────────────────────────────────────────────
+    - name: churn.pods
+      interval: 30s
+      rules:
+
+        - alert: PodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              namespace=~"inference|airflow|monitoring|mlflow"
+            }[15m]) > 3
+          for: 0m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "Pod crash-looping: {{ $labels.pod }} (ns={{ $labels.namespace }})"
+            description: |
+              Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes.
+              Check logs: kubectl logs -n {{ $labels.namespace }} {{ $labels.pod }} --previous
+
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{
+              reason="OOMKilled",
+              namespace=~"inference|airflow|mlflow"
+            } == 1
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "OOMKilled: {{ $labels.container }} in {{ $labels.namespace }}"
+            description: |
+              Container {{ $labels.container }} was OOM-killed.
+              For inference pods: model is larger than expected — increase memory limit.
+              For Airflow workers: increase worker pod memory in KubernetesExecutor config.
+
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{
+              condition="false",
+              namespace=~"inference|airflow|mlflow"
+            } == 1
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Pod not ready: {{ $labels.pod }}"
+            description: |
+              Pod {{ $labels.pod }} in {{ $labels.namespace }} has been not-ready for 10 minutes.
+
+    # ── Infrastructure ────────────────────────────────────────────────────────
+    - name: churn.infrastructure
+      interval: 60s
+      rules:
+
+        - alert: NodeHighCPU
+          expr: |
+            (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 0.85
+          for: 15m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Node CPU > 85%: {{ $labels.node }}"
+            description: |
+              Node {{ $labels.node }} CPU utilisation is {{ $value | humanizePercentage }}.
+              Consider cluster autoscaler scale-out or workload rescheduling.
+
+        - alert: NodeHighMemory
+          expr: |
+            (
+              node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+            ) / node_memory_MemTotal_bytes > 0.85
+          for: 15m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Node memory > 85%: {{ $labels.node }}"
+            description: |
+              Node {{ $labels.node }} memory is {{ $value | humanizePercentage }} used.
+
+        - alert: PVCUsageHigh
+          expr: |
+            kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.80
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} > 80% full"
+            description: |
+              PVC {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} is
+              {{ $value | humanizePercentage }} full. Expand the PVC before it runs out.
+              For Prometheus: increase storageSpec.size in values.yaml.

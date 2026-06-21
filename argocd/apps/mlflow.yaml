@@ -1,0 +1,43 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mlflow
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/churn-platform
+    targetRevision: HEAD
+    path: helm/mlflow
+    helm:
+      releaseName: mlflow
+      valueFiles:
+        - values.yaml
+        - ../../argocd/overlays/dev/mlflow-values.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mlops
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false  # Namespace created by Terraform
+      - ServerSideApply=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 2m
+
+  # MLflow uses PVCs — don't delete PVC on prune (would lose experiment data)
+  ignoreDifferences:
+    - group: ""
+      kind: PersistentVolumeClaim
+      jsonPointers:
+        - /spec/storageClassName

@@ -1,0 +1,76 @@
+# ArgoCD Application — Inference Service
+# Watches helm/inference/ + environment overlay for the image tag
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: inference
+  namespace: argocd
+spec:
+  # ApplicationSet generates one Application per environment
+  generators:
+    - list:
+        elements:
+          - env: dev
+            revision: HEAD
+            # Dev auto-syncs — developers get immediate feedback
+            autoSync: "true"
+          - env: staging
+            revision: HEAD
+            autoSync: "true"
+          - env: prod
+            # Prod only syncs from tagged releases, never from HEAD
+            revision: "refs/tags/v*"
+            autoSync: "false"  # Manual sync required in prod
+
+  template:
+    metadata:
+      name: "inference-{{env}}"
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: "{{env}}"
+      sources:
+        # Source 1: Helm chart in inference/helm/
+        - repoURL: https://github.com/YOUR_ORG/churn-platform
+          targetRevision: "{{revision}}"
+          path: inference/helm
+          helm:
+            releaseName: "churn-inference"
+            valueFiles:
+              - "$values/argocd/overlays/{{env}}/inference-values.yaml"
+            # Image tag injected by GitHub Actions CI at deploy time:
+            #   argocd app set inference-{{env}} \
+            #     --helm-set image.tag=<GIT_SHA> \
+            #     --helm-set image.repository=<ECR_URI>
+
+        # Source 2: values overlay (same repo, different path ref)
+        - repoURL: https://github.com/YOUR_ORG/churn-platform
+          targetRevision: "{{revision}}"
+          ref: values
+
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: inference
+
+      syncPolicy:
+        automated:
+          prune: "{{autoSync}}"
+          selfHeal: "{{autoSync}}"
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true  # Handles large CRDs better than client-side apply
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 2m
+
+      # Health checks — ArgoCD understands Deployment rollout status
+      # but not custom resources. Override for specific resources here.
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas  # HPA manages replicas — ignore Terraform-set value

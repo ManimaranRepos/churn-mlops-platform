@@ -1,0 +1,20 @@
+# Airflow providers — keep versions pinned to avoid provider-core incompatibility
+apache-airflow-providers-amazon==8.19.0      # S3, Glue, SageMaker, Athena, CloudWatch operators
+apache-airflow-providers-http==4.10.0        # HTTP sensor (for MLflow health check)
+
+# AWS data access
+awswrangler==3.7.1                           # Athena + S3 Parquet (used in DAG tasks)
+boto3==1.34.0
+botocore==1.34.0
+
+# Data processing (used in export_train_val_test_splits task)
+pandas==2.2.1
+pyarrow==15.0.1
+scikit-learn==1.4.1
+numpy==1.26.4
+
+# Data validation
+great-expectations==0.18.13
+
+# Utilities
+cryptography==42.0.5                         # Required by Fernet key handling

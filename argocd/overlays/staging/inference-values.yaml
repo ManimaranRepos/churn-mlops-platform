@@ -1,0 +1,25 @@
+# Staging overlay — mirrors prod topology, uses Staging model
+# image.repository and image.tag injected by GitHub Actions at deploy time
+
+env:
+  ENVIRONMENT: staging
+  MODEL_STAGE: Staging
+
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1500m"
+    memory: "2Gi"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 60
+
+ingress:
+  enabled: true

@@ -1,0 +1,60 @@
+# Cluster Autoscaler
+# Scales EKS managed node groups based on pod scheduling pressure
+
+autoDiscovery:
+  clusterName: ${cluster_name}  # Discovers node groups via the tags we set in Terraform
+
+awsRegion: ${aws_region}
+
+rbac:
+  serviceAccount:
+    create: true
+    name: cluster-autoscaler
+    annotations:
+      eks.amazonaws.com/role-arn: ${role_arn}
+
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 300Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+extraArgs:
+  # After a scale-up, wait 10 min before considering scale-down
+  # Prevents thrashing when workloads restart
+  scale-down-delay-after-add: "10m"
+  # Node must be underutilized for 10 min before scale-down
+  scale-down-unneeded-time: "10m"
+  # Don't scale down below 50% utilization
+  scale-down-utilization-threshold: "0.5"
+  # Skip nodes with pods that don't have a PDB — safer for stateful workloads
+  skip-nodes-with-local-storage: "false"
+  skip-nodes-with-system-pods: "true"
+  # Expander: which node group to pick when multiple can satisfy a pod
+  # least-waste: picks the group that wastes the fewest resources
+  expander: least-waste
+  # Balance similar node groups: spread pods across AZs for HA
+  balance-similar-node-groups: "true"
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+# CA must run on general nodes, not inference (which is dedicated)
+nodeSelector:
+  role: general
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "general"
+    effect: "PreferNoSchedule"
+
+serviceMonitor:
+  enabled: true
+  namespace: monitoring
+  selector:
+    release: kube-prometheus-stack

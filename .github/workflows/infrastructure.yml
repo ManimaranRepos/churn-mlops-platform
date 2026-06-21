@@ -1,0 +1,379 @@
+# =============================================================================
+# INFRASTRUCTURE PIPELINE — Terraform Plan → Approve → Apply
+# =============================================================================
+# Trigger: any push to main that changes terraform/ files
+#          any PR that changes terraform/ files (plan only, no apply)
+#
+# Jobs:
+#   1. validate   — terraform fmt check + validate (fast, no AWS calls needed)
+#   2. plan       — terraform plan, posts diff as PR comment
+#   3. apply      — requires manual approval via GitHub Environment gate
+#
+# GitHub Environments required (set up in repo Settings → Environments):
+#   - dev         (auto-approve)
+#   - staging     (requires 1 reviewer)
+#   - prod        (requires 2 reviewers + deployment branch = main only)
+# =============================================================================
+
+name: Infrastructure Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/infrastructure.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: "us-east-1"
+  # Tells Terraform to never prompt for input (required for CI)
+  TF_INPUT: "false"
+  # Show full diff in plan output
+  TF_CLI_ARGS_plan: "-detailed-exitcode"
+
+permissions:
+  id-token: write      # OIDC token generation
+  contents: read       # Checkout code
+  pull-requests: write # Post plan as PR comment
+
+jobs:
+  # ============================================================================
+  # JOB 1: VALIDATE — Static checks, no AWS access needed
+  # ============================================================================
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Wrapper adds Terraform output to step summary automatically
+          terraform_wrapper: true
+
+      - name: Terraform Format Check
+        id: fmt
+        # -check: exit non-zero if files aren't formatted (fail the CI)
+        # -recursive: check all .tf files in subdirectories
+        run: terraform fmt -check -recursive terraform/
+        continue-on-error: false
+
+      - name: Terraform Validate (each environment)
+        run: |
+          for env in dev staging prod; do
+            echo "::group::Validating $env"
+            cd terraform/environments/$env
+            terraform init -backend=false  # Skip backend for validation
+            terraform validate
+            cd ../../..
+            echo "::endgroup::"
+          done
+
+      - name: tfsec — Security scanning
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/
+          # Fail on HIGH and CRITICAL findings — warn on MEDIUM/LOW
+          minimum_severity: HIGH
+          format: sarif
+          soft_fail: false
+
+      - name: Upload tfsec SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif.json
+
+  # ============================================================================
+  # JOB 2: PLAN — Run terraform plan for each environment
+  # Posts a clean diff as a PR comment so reviewers know exactly what changes
+  # ============================================================================
+  plan:
+    name: Plan — ${{ matrix.environment }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel other envs if one fails
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+
+    # Each environment has its own GitHub Environment (controls secret access)
+    environment: ${{ matrix.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "terraform-plan-${{ matrix.environment }}"
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/${{ matrix.environment }}
+        # -out saves the plan to a file — apply will use this exact plan
+        # This ensures what you approved is exactly what gets applied
+        run: |
+          terraform plan \
+            -out=tfplan-${{ matrix.environment }} \
+            -no-color \
+            2>&1 | tee plan-output.txt
+
+          # Exit codes: 0=no changes, 1=error, 2=changes present
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit-code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+
+      - name: Post plan as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync(
+              'terraform/environments/${{ matrix.environment }}/plan-output.txt',
+              'utf8'
+            );
+
+            // Truncate if too long for GitHub comment (65536 char limit)
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n... [truncated]'
+              : planOutput;
+
+            const comment = `## Terraform Plan — \`${{ matrix.environment }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>
+
+            *Workflow: \`${{ github.workflow }}\` | Run: \`${{ github.run_id }}\`*`;
+
+            // Find existing comment and update it, or create new
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c =>
+              c.body.includes(`Terraform Plan — \`${{ matrix.environment }}\``)
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ github.sha }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan-${{ matrix.environment }}
+          # Plans are only valid for the code that generated them
+          # Keep for 7 days then expire (avoid stale plans being applied)
+          retention-days: 7
+
+  # ============================================================================
+  # JOB 3: APPLY — Downloads the approved plan and applies it
+  # Gate: GitHub Environment protection rules enforce human approval
+  # Only runs on push to main (not on PRs — PRs only plan)
+  # ============================================================================
+  apply:
+    name: Apply — ${{ matrix.environment }}
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      # Apply environments sequentially: dev first, then staging, then prod
+      # If dev breaks, don't touch staging/prod
+      max-parallel: 1
+      matrix:
+        environment: [dev, staging, prod]
+
+    # This is the key: GitHub will PAUSE here and wait for a human approval
+    # before proceeding. Configured in repo Settings → Environments.
+    environment: ${{ matrix.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "terraform-apply-${{ matrix.environment }}"
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform init
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ github.sha }}
+          path: terraform/environments/${{ matrix.environment }}/
+
+      - name: Terraform Apply
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            tfplan-${{ matrix.environment }}
+
+      - name: Capture outputs for downstream jobs
+        id: tf-outputs
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          # Export key outputs so other pipelines can use them
+          terraform output -json > tf-outputs-${{ matrix.environment }}.json
+          echo "Terraform apply complete for ${{ matrix.environment }}"
+
+      - name: Upload outputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs-${{ matrix.environment }}-${{ github.sha }}
+          path: terraform/environments/${{ matrix.environment }}/tf-outputs-${{ matrix.environment }}.json
+          retention-days: 1
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Terraform apply succeeded for *${{ matrix.environment }}*",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "✅ *Infrastructure deployed* to `${{ matrix.environment }}`\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 Terraform apply FAILED for *${{ matrix.environment }}*",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🔴 *Infrastructure deploy FAILED* on `${{ matrix.environment }}`\nCommit: `${{ github.sha }}`\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================================================
+  # ROLLBACK JOB — Triggered manually via workflow_dispatch
+  # Rolls back the last terraform apply by reverting the git commit and re-applying
+  # ============================================================================
+  rollback:
+    name: Rollback — ${{ inputs.environment }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout previous commit
+        uses: actions/checkout@v4
+        with:
+          # Apply the parent commit (one before the breaking change)
+          ref: ${{ inputs.rollback-to-sha || 'HEAD~1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "terraform-rollback-${{ inputs.environment }}"
+
+      - name: Rollback apply
+        working-directory: terraform/environments/${{ inputs.environment }}
+        run: |
+          terraform init
+          terraform plan -out=rollback.tfplan
+          terraform apply -auto-approve rollback.tfplan
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to roll back"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      rollback-to-sha:
+        description: "Git SHA to roll back to (leave blank for HEAD~1)"
+        required: false
+        type: string

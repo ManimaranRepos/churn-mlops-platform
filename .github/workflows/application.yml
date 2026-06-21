@@ -1,0 +1,313 @@
+# =============================================================================
+# APPLICATION PIPELINE — Lint → Test → Build → ECR Push → ArgoCD Sync
+# =============================================================================
+# Trigger: push to main affecting inference/, ml/serving/, or Helm charts
+#
+# Jobs:
+#   1. lint-test     — Ruff, mypy, pytest with coverage gate
+#   2. build-push    — Docker build with layer caching → ECR
+#   3. update-image  — Update Helm chart image tag in Git (GitOps trigger)
+#   4. argocd-sync   — Force ArgoCD sync + wait for healthy
+# =============================================================================
+
+name: Application Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "inference/**"
+      - "ml/serving/**"
+      - "helm/**"
+      - ".github/workflows/application.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "inference/**"
+      - "ml/serving/**"
+      - "helm/**"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: churn-platform-inference
+  PYTHON_VERSION: "3.11"
+  MIN_COVERAGE: 80
+
+permissions:
+  id-token: write
+  contents: write  # Needed to push image tag update back to Git
+  pull-requests: write
+
+jobs:
+  # ============================================================================
+  # JOB 1: LINT & TEST
+  # Fast feedback — fails in <5 min before wasting time on Docker build
+  # ============================================================================
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: inference/requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r inference/requirements.txt
+          pip install -r inference/requirements-dev.txt
+
+      - name: Ruff lint
+        run: |
+          # Ruff is 10-100x faster than flake8 — same rules, Rust implementation
+          ruff check inference/ ml/serving/ --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check inference/ ml/serving/
+
+      - name: Type checking (mypy)
+        run: |
+          mypy inference/ ml/serving/ \
+            --ignore-missing-imports \
+            --strict \
+            --no-error-summary
+
+      - name: Run tests with coverage
+        run: |
+          pytest inference/tests/ ml/serving/tests/ \
+            --cov=inference \
+            --cov=ml/serving \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ env.MIN_COVERAGE }} \
+            -v \
+            --tb=short \
+            -x  # Stop after first failure
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+      - name: Helm lint
+        run: |
+          # Lint all Helm charts we own
+          for chart in helm/inference helm/mlflow helm/airflow; do
+            if [ -d "$chart" ]; then
+              echo "Linting $chart..."
+              helm lint "$chart" --strict
+            fi
+          done
+
+  # ============================================================================
+  # JOB 2: BUILD & PUSH TO ECR
+  # Uses Docker layer caching via GitHub Actions cache — cuts rebuild time
+  # by 70%+ on unchanged layers (OS packages, pip installs rarely change)
+  # ============================================================================
+  build-push:
+    name: Build & Push Docker Image
+    needs: lint-test
+    runs-on: ubuntu-latest
+
+    # Only build on main push — PRs just lint/test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "ecr-push"
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            # Tag with short git SHA (7 chars) — used in Helm chart values
+            type=sha,prefix=,suffix=,format=short
+            # Tag with 'latest' on main branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Semantic version tags if we push a git tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Buildx enables BuildKit — required for cache-from/cache-to
+          driver-opts: image=moby/buildkit:latest
+
+      - name: Build and push with layer caching
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: inference/
+          file: inference/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache layers in GitHub Actions cache — saves 2-5 min per build
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+          # Security: don't include build secrets in final image
+          # Provenance creates SBOM attestations for supply chain security
+          provenance: true
+          sbom: true
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          # Fail on CRITICAL vulnerabilities — warn on HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ============================================================================
+  # JOB 3: UPDATE IMAGE TAG IN GIT (GitOps trigger)
+  # Updates the Helm values file with the new image tag, commits it.
+  # ArgoCD watches this file and automatically syncs when it changes.
+  # This is the GitOps principle: Git is the single source of truth.
+  # ============================================================================
+  update-image-tag:
+    name: Update Image Tag in Git
+    needs: build-push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use a token that can push back to main
+          # The default GITHUB_TOKEN can't push if branch protection is on
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Update image tag in Helm values (dev)
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+
+          # Use yq to precisely update only the image tag field
+          # sed would work but is fragile — yq understands YAML structure
+          yq -i ".image.tag = \"${SHORT_SHA}\"" \
+            argocd/overlays/dev/inference-values.yaml
+
+          echo "Updated inference image tag to: ${SHORT_SHA}"
+
+      - name: Commit and push tag update
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add argocd/overlays/dev/inference-values.yaml
+          git commit -m "chore: update inference image tag to ${{ github.sha }}"
+          git push
+
+  # ============================================================================
+  # JOB 4: ARGOCD SYNC
+  # Triggers ArgoCD to sync immediately rather than waiting for the default
+  # 3-minute poll interval. Then waits for the deployment to become healthy.
+  # ============================================================================
+  argocd-sync:
+    name: ArgoCD Sync & Health Check
+    needs: update-image-tag
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Configure AWS credentials (to get EKS token)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "argocd-sync"
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Trigger ArgoCD sync and wait
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          # Sync the inference app immediately
+          argocd app sync inference-dev \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --insecure \
+            --timeout 300 \
+            --retry-limit 3
+
+          # Wait for all pods to be healthy before declaring success
+          argocd app wait inference-dev \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --insecure \
+            --health \
+            --timeout 300
+
+          echo "✅ ArgoCD sync complete and application is healthy"
+
+      - name: Run smoke tests against new deployment
+        run: |
+          # Hit the inference endpoint with a known input and check the response
+          INFERENCE_URL="${{ secrets.INFERENCE_URL }}"
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${INFERENCE_URL}/predict" \
+            -H "Content-Type: application/json" \
+            -d '{"customer_id": "smoke-test-001", "session_duration": 120, "transaction_amount": 500}')
+
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | head -1)
+
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Smoke test failed: HTTP $http_code"
+            echo "Response: $body"
+            exit 1
+          fi
+
+          echo "✅ Smoke test passed: HTTP $http_code"
+          echo "Response: $body"

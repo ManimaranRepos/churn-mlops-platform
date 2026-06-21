@@ -1,0 +1,306 @@
+# =============================================================================
+# Apache Airflow — Helm Values
+# Chart: apache-airflow/airflow v1.13.x
+# Namespace: airflow
+#
+# WHY KubernetesExecutor?
+#   CeleryExecutor needs persistent Redis + permanent worker pods running 24/7.
+#   With KubernetesExecutor, Airflow spawns a pod per task and deletes it when
+#   the task finishes. Zero idle cost. Our workloads are bursty (big training
+#   pipeline once/day) so idle workers waste money the rest of the time.
+#   Tradeoff: slightly higher task startup latency (~10s for pod scheduling),
+#   which is irrelevant for workloads measured in minutes.
+#
+# DAG delivery: gitSync (sidecar pulls from private repo on Git push)
+#   WHY not bake DAGs into the image?
+#   GitSync lets data engineers push DAG changes without rebuilding + redeploying
+#   the Airflow image. Image rebuilds gate on CI; DAG changes should be instant.
+#   Tradeoff: if the Git repo is unreachable, DAGs don't update. Acceptable.
+# =============================================================================
+
+airflowVersion: "2.8.4"
+executor: KubernetesExecutor
+
+# ── Docker image ───────────────────────────────────────────────────────────────
+defaultAirflowRepository: "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/churn-platform/airflow"
+defaultAirflowTag: "2.8.4"
+images:
+  airflow:
+    repository: "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/churn-platform/airflow"
+    tag: "2.8.4"
+    pullPolicy: IfNotPresent
+
+# ── Database (Aurora PostgreSQL) ───────────────────────────────────────────────
+# We use our existing Aurora Serverless v2 cluster with a dedicated 'airflow' schema.
+# WHY not the bundled PostgreSQL sub-chart?
+#   The sub-chart creates a StatefulSet with local disk — no HA, no backups.
+#   Aurora gives us Multi-AZ, auto-scaling, and point-in-time recovery.
+data:
+  metadataSecretName: airflow-db-secret  # Created by External Secrets Operator below
+  resultBackendSecretName: airflow-db-secret
+
+# ── External Secrets — syncs credentials from Secrets Manager ─────────────────
+extraObjects:
+  - apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: airflow-db-secret
+      namespace: airflow
+    spec:
+      secretStoreRef:
+        name: aws-secrets-store
+        kind: ClusterSecretStore
+      target:
+        name: airflow-db-secret
+        template:
+          type: Opaque
+          data:
+            # Airflow expects these specific key names for metadataConnection
+            connection: "postgresql://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/{{ .dbname }}"
+      data:
+        - secretKey: username
+          remoteRef:
+            key: "churn-platform-dev/airflow/db-credentials"
+            property: username
+        - secretKey: password
+          remoteRef:
+            key: "churn-platform-dev/airflow/db-credentials"
+            property: password
+        - secretKey: host
+          remoteRef:
+            key: "churn-platform-dev/airflow/db-credentials"
+            property: host
+        - secretKey: port
+          remoteRef:
+            key: "churn-platform-dev/airflow/db-credentials"
+            property: port
+        - secretKey: dbname
+          remoteRef:
+            key: "churn-platform-dev/airflow/db-credentials"
+            property: dbname
+      refreshInterval: "1h"
+
+  - apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: airflow-fernet-key
+      namespace: airflow
+    spec:
+      secretStoreRef:
+        name: aws-secrets-store
+        kind: ClusterSecretStore
+      target:
+        name: airflow-fernet-key
+      data:
+        - secretKey: fernet-key
+          remoteRef:
+            key: "churn-platform-dev/airflow/fernet-key"
+            property: fernet_key
+      refreshInterval: "24h"
+
+  - apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: airflow-git-ssh-key
+      namespace: airflow
+    spec:
+      secretStoreRef:
+        name: aws-secrets-store
+        kind: ClusterSecretStore
+      target:
+        name: airflow-git-ssh-key
+      data:
+        - secretKey: gitSshKey
+          remoteRef:
+            key: "churn-platform-dev/airflow/git-ssh-key"
+            property: private_key
+      refreshInterval: "24h"
+
+# ── Fernet key ─────────────────────────────────────────────────────────────────
+fernetKeySecretName: airflow-fernet-key
+
+# ── Webserver ──────────────────────────────────────────────────────────────────
+webserver:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  service:
+    type: ClusterIP
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+    hosts:
+      - name: airflow.internal.churn-platform.dev
+        tls:
+          secretName: airflow-tls
+
+  # Default admin user — password must be changed on first login
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    email: admin@churn-platform.dev
+    firstName: Airflow
+    lastName: Admin
+    password: "CHANGE_ON_FIRST_LOGIN"
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+scheduler:
+  replicas: 2  # HA: two schedulers, one is active (leader election via DB)
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  livenessProbe:
+    initialDelaySeconds: 60
+    timeoutSeconds: 20
+    failureThreshold: 5
+
+# ── Triggerer (for async operators — S3KeySensor, SageMakerTrainingOperator) ──
+triggerer:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ── KubernetesExecutor — pod template for task pods ──────────────────────────
+workers:
+  # KubernetesExecutor doesn't use persistent workers — this is the pod template
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+  # All task pods land on general nodes (not inference or GPU nodes)
+  nodeSelector:
+    role: general
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: general
+      effect: PreferNoSchedule
+
+# ── Service account — IRSA ─────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: airflow-worker
+  annotations:
+    eks.amazonaws.com/role-arn: "AIRFLOW_ROLE_ARN_PLACEHOLDER"
+
+# ── gitSync — pulls DAGs from private GitHub repo ─────────────────────────────
+dags:
+  gitSync:
+    enabled: true
+    repo: "git@github.com:YOUR_ORG/churn-platform.git"
+    branch: main
+    rev: HEAD
+    depth: 1              # Shallow clone — only latest commit (faster)
+    maxFailures: 3        # Alert after 3 consecutive sync failures
+    subPath: "airflow/dags"  # Only sync the dags/ directory
+    wait: 60             # Re-sync every 60 seconds
+    containerName: git-sync
+    sshKeySecret: airflow-git-ssh-key
+
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+# ── S3 remote logging ─────────────────────────────────────────────────────────
+# WHY S3 logging?
+#   Task pods are ephemeral — logs vanish when the pod terminates.
+#   S3 logging writes logs to S3 in real time so they're accessible after pod deletion.
+#   Also enables cross-team log sharing without kubectl access.
+logs:
+  persistence:
+    enabled: false  # Disable local PVC
+  # S3 logging is configured via AIRFLOW__LOGGING__* env vars below
+
+# ── Environment variables ──────────────────────────────────────────────────────
+env:
+  # Remote logging → S3
+  - name: AIRFLOW__LOGGING__REMOTE_LOGGING
+    value: "True"
+  - name: AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER
+    value: "s3://ARTIFACTS_BUCKET_PLACEHOLDER/airflow-logs"
+  - name: AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID
+    value: "aws_default"
+  - name: AIRFLOW__LOGGING__ENCRYPT_S3_LOGS
+    value: "True"
+
+  # Kubernetes executor config
+  - name: AIRFLOW__KUBERNETES__NAMESPACE
+    value: "airflow"
+  - name: AIRFLOW__KUBERNETES__WORKER_CONTAINER_REPOSITORY
+    value: "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/churn-platform/airflow"
+  - name: AIRFLOW__KUBERNETES__WORKER_CONTAINER_TAG
+    value: "2.8.4"
+  - name: AIRFLOW__KUBERNETES__DELETE_WORKER_PODS
+    value: "True"  # Delete task pod after completion (don't leave succeeded pods)
+  - name: AIRFLOW__KUBERNETES__DELETE_WORKER_PODS_ON_FAILURE
+    value: "False" # Keep failed pods for log inspection
+
+  # Core Airflow settings
+  - name: AIRFLOW__CORE__LOAD_EXAMPLES
+    value: "False"  # Don't clutter UI with example DAGs
+  - name: AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG
+    value: "1"  # Prevent concurrent runs of the same DAG (avoids race conditions)
+  - name: AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL
+    value: "30"  # Re-parse DAG files every 30s
+
+  # SageMaker region for AWS operators
+  - name: AWS_DEFAULT_REGION
+    value: "us-east-1"
+
+  # Platform-specific
+  - name: ENVIRONMENT
+    value: "dev"
+  - name: PROJECT
+    value: "churn-platform"
+
+# ── Metrics (Prometheus) ───────────────────────────────────────────────────────
+statsd:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+# ── Pod Disruption Budget ──────────────────────────────────────────────────────
+webserverPdb:
+  enabled: true
+  minAvailable: 1
+
+schedulerPdb:
+  enabled: true
+  minAvailable: 1

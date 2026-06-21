@@ -1,0 +1,106 @@
+# =============================================================================
+# Gatekeeper Constraints — applies the ConstraintTemplates to our namespaces
+#
+# Constraint enforcement modes:
+#   dryrun — violations are logged but not blocked (use during rollout)
+#   warn   — violations are blocked but with a warning (use for staged rollout)
+#   deny   — violations are hard-blocked (use in production)
+#
+# Rollout strategy for new constraints:
+#   1. Deploy in dryrun → check `kubectl get <constraint> -o json | jq .status.violations`
+#   2. Fix violations in existing workloads
+#   3. Switch to warn (soft block) for 1 week
+#   4. Switch to deny (hard block) for production
+#
+# These constraints apply to: inference, airflow, mlflow namespaces.
+# Excluded: kube-system, kube-public, gatekeeper-system (system namespaces).
+# =============================================================================
+
+---
+# Constraint 1: Every container must declare resource requests and limits
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireResourceLimits
+metadata:
+  name: require-resource-limits
+  annotations:
+    description: "All containers in inference/airflow/mlflow must have resource requests and limits"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces:
+      - inference
+      - airflow
+      - mlflow
+      - monitoring
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - gatekeeper-system
+      - cert-manager
+      - external-secrets
+  parameters:
+    exemptImages:
+      # AWS-managed pause container — minimal image, no resources needed
+      - "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/pause"
+      # Gatekeeper audit container
+      - "openpolicyagent/gatekeeper"
+
+---
+# Constraint 2: All containers must run as non-root
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireNonRoot
+metadata:
+  name: require-non-root
+  annotations:
+    description: "All containers must run as non-root (UID != 0)"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces:
+      - inference
+      - airflow
+      - mlflow
+      - monitoring
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - gatekeeper-system
+      - cert-manager
+      - external-secrets
+
+---
+# Constraint 3: No :latest image tags
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: DisallowLatestTag
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    description: "Container images must use pinned tags or SHA digests — never :latest"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces:
+      - inference
+      - airflow
+      - mlflow
+      - monitoring
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - gatekeeper-system
+      - cert-manager
+      - external-secrets
+  parameters:
+    exemptImages:
+      # Public images without explicit version pinning in Helm charts
+      - "openpolicyagent/gatekeeper"
+      - "datareply/alertmanager-sns-forwarder"

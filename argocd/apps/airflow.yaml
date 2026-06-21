@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: airflow
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: airflow
+
+  # Multi-source: official Helm chart + our values from Git
+  sources:
+    - repoURL: https://airflow.apache.org
+      chart: airflow
+      targetRevision: "1.13.1"
+      helm:
+        releaseName: airflow
+        valueFiles:
+          - $values/airflow/helm/values.yaml
+
+    - repoURL: "https://github.com/YOUR_ORG/churn-platform.git"
+      targetRevision: HEAD
+      ref: values
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    # HPA manages replica counts — don't let ArgoCD revert them
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    # DB migration job completes and ArgoCD sees drift — ignore
+    - group: batch
+      kind: Job
+      jsonPointers:
+        - /spec/suspend

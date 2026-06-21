@@ -1,0 +1,159 @@
+# =============================================================================
+# MLflow Tracking Server — Helm Values
+# Deployed to: mlops namespace on EKS
+# Accessed by: training jobs (SageMaker → VPC endpoint → EKS service)
+# =============================================================================
+
+replicaCount: 2  # HA: if one pod restarts during training, experiments keep logging
+
+image:
+  repository: "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/churn-platform/mlflow-server"
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ── Service account — IRSA for S3 artifact access ────────────────────────────
+serviceAccount:
+  create: true
+  name: mlflow
+  annotations:
+    # IRSA: this pod gets IAM permissions to read/write S3 artifact bucket
+    eks.amazonaws.com/role-arn: "SAGEMAKER_ROLE_ARN_PLACEHOLDER"
+
+# ── Environment variables ─────────────────────────────────────────────────────
+env:
+  # DB URI: assembled from External Secrets injected values
+  - name: DB_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-db-credentials  # Created by External Secrets Operator
+        key: username
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-db-credentials
+        key: password
+  - name: DB_HOST
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-db-credentials
+        key: host
+  - name: DB_PORT
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-db-credentials
+        key: port
+  - name: DB_NAME
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-db-credentials
+        key: dbname
+  - name: MLFLOW_BACKEND_STORE_URI
+    value: "postgresql://$(DB_USERNAME):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+  - name: MLFLOW_DEFAULT_ARTIFACT_ROOT
+    value: "s3://ARTIFACTS_BUCKET_PLACEHOLDER/mlflow-artifacts"
+  - name: MLFLOW_WORKERS
+    value: "4"
+  - name: AWS_DEFAULT_REGION
+    value: "us-east-1"
+
+# ── External Secret — syncs Aurora credentials from Secrets Manager ───────────
+externalSecret:
+  enabled: true
+  secretStoreRef:
+    name: aws-secrets-store  # ClusterSecretStore created by External Secrets Operator
+    kind: ClusterSecretStore
+  target:
+    name: mlflow-db-credentials
+  data:
+    - secretKey: username
+      remoteRef:
+        key: "churn-platform-dev/mlflow/db-credentials"
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: "churn-platform-dev/mlflow/db-credentials"
+        property: password
+    - secretKey: host
+      remoteRef:
+        key: "churn-platform-dev/mlflow/db-credentials"
+        property: host
+    - secretKey: port
+      remoteRef:
+        key: "churn-platform-dev/mlflow/db-credentials"
+        property: port
+    - secretKey: dbname
+      remoteRef:
+        key: "churn-platform-dev/mlflow/db-credentials"
+        property: dbname
+  refreshInterval: "1h"
+
+# ── Resources ──────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# ── Service ────────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP  # Only reachable within cluster — exposed via Ingress below
+  port: 5000
+
+# ── Ingress — ALB for UI access ───────────────────────────────────────────────
+ingress:
+  enabled: true
+  ingressClassName: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal  # Only accessible via VPN
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+  hosts:
+    - host: mlflow.internal.churn-platform.dev
+      paths:
+        - path: /
+          pathType: Prefix
+
+# ── HPA — scale up during large experiment sweeps ────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70  # MLflow is CPU-bound during metric logging
+
+# ── Persistence — SQLite fallback (not used with Aurora, but needed for chart) ─
+persistence:
+  enabled: false  # We use Aurora PostgreSQL, not local SQLite
+
+# ── Node placement ─────────────────────────────────────────────────────────────
+nodeSelector:
+  role: general
+
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: general
+    effect: PreferNoSchedule
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: mlflow
+        topologyKey: kubernetes.io/hostname  # Each replica on a different node
+
+# ── Prometheus metrics ─────────────────────────────────────────────────────────
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    namespace: monitoring
+    interval: 30s
+
+# ── Pod Disruption Budget ──────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

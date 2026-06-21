@@ -1,0 +1,538 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "datasource", "id": "cloudwatch", "name": "CloudWatch", "version": "1.0.0" }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": { "type": "prometheus" },
+        "enable": true,
+        "expr": "changes(kube_deployment_status_replicas_updated{namespace='inference'}[2m]) > 0",
+        "hide": false,
+        "iconColor": "green",
+        "name": "Inference Deployments",
+        "step": "60s",
+        "titleFormat": "Deploy: {{deployment}}"
+      }
+    ]
+  },
+  "description": "Churn Platform — End-to-end observability: Inference API, Airflow pipelines, ML model metrics, infrastructure",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Inference API",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          },
+          "unit": "percentunit",
+          "mappings": []
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" },
+      "title": "Error Rate (5m)",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "sum(rate(churn_api_errors_total[5m])) / sum(rate(churn_api_requests_total[5m]))",
+          "legendFormat": "error rate"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.3 }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "title": "P99 Latency",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(churn_api_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          },
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "title": "Cache Hit Ratio",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "sum(rate(churn_api_cache_hits_total[5m])) / sum(rate(churn_api_requests_total[5m]))",
+          "legendFormat": "cache hit ratio"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "title": "Request Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "sum(rate(churn_api_requests_total[1m]))",
+          "legendFormat": "req/s"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "s"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p50" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p95" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p99" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 5,
+      "options": { "tooltip": { "mode": "multi" } },
+      "title": "Inference Latency Percentiles",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(churn_api_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(churn_api_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(churn_api_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 6,
+      "title": "Request Rate & Error Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(churn_api_requests_total[1m]))",
+          "legendFormat": "requests/s"
+        },
+        {
+          "expr": "sum(rate(churn_api_errors_total[1m]))",
+          "legendFormat": "errors/s"
+        },
+        {
+          "expr": "sum(rate(churn_api_cache_hits_total[1m]))",
+          "legendFormat": "cache hits/s"
+        }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 101,
+      "title": "ML Pipeline (Airflow)",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 14 },
+      "id": 10,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "title": "Failed DAG Runs (24h)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(increase(airflow_dag_run_duration{state='failed'}[24h]))",
+          "legendFormat": "failures"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 14 },
+      "id": 11,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "title": "Scheduler Heartbeat",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "airflow_scheduler_heartbeat",
+          "legendFormat": "heartbeat"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "id": 12,
+      "title": "DAG Run Duration (last 7d)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "airflow_dag_run_duration{dag_id='churn_feature_pipeline', state='success'}",
+          "legendFormat": "feature_pipeline"
+        },
+        {
+          "expr": "airflow_dag_run_duration{dag_id='churn_training_pipeline', state='success'}",
+          "legendFormat": "training_pipeline"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "id": 13,
+      "title": "Airflow Task State Distribution",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (state) (airflow_task_instance_created)",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "id": 102,
+      "title": "Data Quality",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 27 },
+      "id": 20,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "title": "Open Data Quality Issues",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "churn_dag_metric{metric_name='DataQualityIssues'}",
+          "legendFormat": "issues"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "cloudwatch" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "id": 21,
+      "title": "Kinesis Incoming Records (15m sum)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "cloudwatch" },
+          "dimensions": { "StreamName": "${kinesis_stream_name}" },
+          "expression": "",
+          "highResolution": false,
+          "id": "kinesis_incoming",
+          "matchExact": true,
+          "metricName": "IncomingRecords",
+          "namespace": "AWS/Kinesis",
+          "period": "900",
+          "refId": "A",
+          "statistics": ["Sum"],
+          "region": "us-east-1",
+          "legendFormat": "IncomingRecords"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "cloudwatch" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "ms" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "id": 22,
+      "title": "Kinesis Iterator Age (max)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "cloudwatch" },
+          "dimensions": { "StreamName": "${kinesis_stream_name}" },
+          "metricName": "GetRecords.IteratorAgeMilliseconds",
+          "namespace": "AWS/Kinesis",
+          "period": "900",
+          "statistics": ["Maximum"],
+          "region": "us-east-1",
+          "legendFormat": "IteratorAge"
+        }
+      ]
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "id": 103,
+      "title": "Infrastructure",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 30,
+      "title": "Node CPU Utilisation",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "1 - avg by (node) (rate(node_cpu_seconds_total{mode='idle'}[5m]))",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 31,
+      "title": "Node Memory Usage",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+          "legendFormat": "{{instance}} used"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "id": 32,
+      "title": "Pod Restarts (15m) by Namespace",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (namespace) (increase(kube_pod_container_status_restarts_total{namespace=~'inference|airflow|mlflow|monitoring'}[15m]))",
+          "legendFormat": "{{namespace}}"
+        }
+      ]
+    },
+
+    {
+      "datasource": { "type": "cloudwatch" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "id": 33,
+      "title": "ElastiCache Memory Usage",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "cloudwatch" },
+          "dimensions": { "ReplicationGroupId": "${elasticache_cluster_id}" },
+          "metricName": "DatabaseMemoryUsagePercentage",
+          "namespace": "AWS/ElastiCache",
+          "period": "300",
+          "statistics": ["Average"],
+          "region": "us-east-1",
+          "legendFormat": "Memory %"
+        }
+      ]
+    }
+
+  ],
+
+  "schemaVersion": 38,
+  "tags": ["churn-platform", "mlops", "inference"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": { "type": "prometheus" },
+        "definition": "label_values(churn_api_requests_total, env)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Environment",
+        "multi": false,
+        "name": "env",
+        "options": [],
+        "query": { "query": "label_values(churn_api_requests_total, env)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "value": "churn-events" },
+        "hide": 0,
+        "label": "Kinesis Stream",
+        "name": "kinesis_stream_name",
+        "options": [{ "selected": true, "text": "churn-events", "value": "churn-events" }],
+        "query": "churn-events",
+        "type": "textbox"
+      },
+      {
+        "current": { "value": "churn-platform-dev-redis" },
+        "hide": 0,
+        "label": "ElastiCache Cluster ID",
+        "name": "elasticache_cluster_id",
+        "options": [{ "selected": true, "text": "churn-platform-dev-redis", "value": "churn-platform-dev-redis" }],
+        "query": "churn-platform-dev-redis",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Churn Platform — Overview",
+  "uid": "churn-platform-overview",
+  "version": 1
+}

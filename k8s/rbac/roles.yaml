@@ -1,0 +1,113 @@
+# RBAC — Role-Based Access Control
+# Principle: each team/service gets the minimum permissions needed in their namespace
+# Data scientists should NOT be able to modify inference deployments (risk of breaking prod)
+
+# ── Data Scientist Role (mlops namespace) ─────────────────────────────────────
+# Can submit training jobs, view logs, manage experiments — cannot touch secrets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: data-scientist
+  namespace: mlops
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]  # Read-only on deployments
+  # Cannot access: secrets, rbac, persistent volumes
+---
+# ── Airflow Worker Service Account (airflow namespace) ────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow-worker
+  namespace: airflow
+  annotations:
+    # This SA gets the Glue + S3 permissions via IRSA (set up separately)
+    eks.amazonaws.com/role-arn: "PLACEHOLDER_SET_BY_TERRAFORM"
+---
+# ── MLflow Service Account (mlops namespace) ──────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mlflow
+  namespace: mlops
+  annotations:
+    eks.amazonaws.com/role-arn: "PLACEHOLDER_SET_BY_TERRAFORM"
+---
+# ── Inference Service Account (inference namespace) ───────────────────────────
+# Needs to read model artifacts from S3 and call SageMaker endpoint
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inference-server
+  namespace: inference
+  annotations:
+    eks.amazonaws.com/role-arn: "PLACEHOLDER_SET_BY_TERRAFORM"
+---
+# ── ClusterRole for monitoring ─────────────────────────────────────────────────
+# Prometheus needs to scrape metrics from all namespaces
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-scraper
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - nodes/metrics
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-scraper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-scraper
+subjects:
+  - kind: ServiceAccount
+    name: kube-prometheus-stack-prometheus
+    namespace: monitoring
+---
+# ── Pod Disruption Budgets ─────────────────────────────────────────────────────
+# Ensures Kubernetes won't evict too many pods at once during node drain/upgrade
+# Without PDBs, a rolling update could take down ALL inference pods simultaneously
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: inference-pdb
+  namespace: inference
+spec:
+  # At least 50% of inference pods must be running at all times
+  # Kubernetes won't drain a node if it would violate this
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      app: inference-server
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mlflow-pdb
+  namespace: mlops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mlflow

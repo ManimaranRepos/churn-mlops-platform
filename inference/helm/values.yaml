@@ -1,0 +1,181 @@
+# =============================================================================
+# Helm values for the churn-inference FastAPI deployment
+#
+# Deployed via ArgoCD (argocd/apps/inference.yaml)
+# Uses the standard bitnami/common or a custom chart — see inference/helm/Chart.yaml
+# =============================================================================
+
+replicaCount: 2    # Minimum 2 for HA; HPA scales up under load
+
+image:
+  repository: ""         # Filled at deploy time: <account>.dkr.ecr.us-east-1.amazonaws.com/churn-inference
+  tag: ""                # Filled at deploy time: git SHA
+  pullPolicy: IfNotPresent
+
+# ── Environment configuration ─────────────────────────────────────────────────
+env:
+  ENVIRONMENT: ""                      # Overridden per-environment (dev/staging/prod)
+  MODEL_NAME: "churn-prediction"
+  MODEL_STAGE: "Production"
+  CACHE_TTL_SECONDS: "300"
+  APP_VERSION: ""                      # Filled at deploy time: git SHA
+
+# ── Secrets via External Secrets Operator ─────────────────────────────────────
+# ESO syncs these from AWS Secrets Manager → Kubernetes Secrets → env vars
+externalSecrets:
+  - name: mlflow-tracking-uri
+    secretKey: MLFLOW_TRACKING_URI
+    remoteRef:
+      key: "churn-platform/mlflow/tracking-uri"
+      property: uri
+  - name: redis-url
+    secretKey: REDIS_URL
+    remoteRef:
+      key: "churn-platform/elasticache/redis-url"
+      property: url
+
+# ── Resource requests/limits ──────────────────────────────────────────────────
+# WHY 1 vCPU request, 2 vCPU limit?
+#   Model load at startup is CPU-intensive (XGBoost/PyTorch deserialisation).
+#   Giving 2 vCPU burst capacity prevents startup from being throttled.
+#   Steady-state inference uses ~0.5 vCPU per worker at moderate QPS.
+# WHY 2Gi memory?
+#   Two Gunicorn workers × ~600MB per worker (model + preprocessor + Python runtime).
+#   Limit at 3Gi gives headroom for batch requests with large input tensors.
+resources:
+  requests:
+    cpu:    "1000m"
+    memory: "2Gi"
+  limits:
+    cpu:    "2000m"
+    memory: "3Gi"
+
+# ── Horizontal Pod Autoscaler ─────────────────────────────────────────────────
+# Scale on CPU (inference is CPU-bound) with a stabilisation window to
+# prevent thrashing when QPS fluctuates around the threshold.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60     # Wait 60s before scaling up (avoid spike overreaction)
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60              # Add at most 2 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300    # Wait 5 min before scaling down (avoid flapping)
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ── Pod Disruption Budget ─────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1    # At least 1 pod must stay up during node drains / rolling deploys
+
+# ── Affinity: spread pods across AZs ─────────────────────────────────────────
+# WHY soft anti-affinity (preferred, not required)?
+#   "required" would block scheduling if only one node is available (e.g., in dev).
+#   "preferred" still spreads when possible, but degrades gracefully on small clusters.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: churn-inference
+          topologyKey: "topology.kubernetes.io/zone"
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations:
+    # Tells ALB controller to include these pods in the target group
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+
+# ── Ingress (ALB) ─────────────────────────────────────────────────────────────
+# Two target groups: stable and canary (managed by canary_deploy.py)
+# During normal operation: 100% to stable target group
+# During canary deploy: 10% canary / 90% stable
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal           # Not public — API Gateway is the public endpoint
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/group.name: churn-platform   # Share ALB with other services
+  hosts:
+    - host: ""     # ALB DNS name — not a hostname-based route
+      paths:
+        - path: /predict
+          pathType: Prefix
+        - path: /health
+          pathType: Prefix
+        - path: /metrics
+          pathType: Prefix
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+# Startup probe allows 3 min for model download (MLflow artifact download can
+# take 60-90s for large models). Without startup probe, liveness would fail
+# during download and Kubernetes would restart the pod in a crash loop.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  failureThreshold: 18    # 18 × 10s = 3 minutes for model download
+  periodSeconds: 10
+
+# ── IRSA service account ──────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: churn-inference
+  annotations:
+    eks.amazonaws.com/role-arn: ""    # Filled at deploy time from Terraform output
+
+# ── Pod security context ──────────────────────────────────────────────────────
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+
+# ── Node selector: Spot instances for non-critical (dev/staging only) ─────────
+nodeSelector: {}   # Overridden in prod values to target on-demand nodes
+
+tolerations: []
+
+# ── Prometheus scraping ───────────────────────────────────────────────────────
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path:   "/metrics"
+  prometheus.io/port:   "8080"

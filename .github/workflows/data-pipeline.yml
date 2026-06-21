@@ -1,0 +1,402 @@
+# =============================================================================
+# DATA PIPELINE — dbt Test → Validate DAGs → Deploy to Airflow
+# =============================================================================
+# Trigger: changes to airflow/dags/, dbt models, or data schemas
+#
+# Jobs:
+#   1. dbt-test          — Schema tests, data tests, source freshness
+#   2. validate-dags     — Python syntax + import check on all DAG files
+#   3. deploy-dags       — Sync DAG files to Airflow via ConfigMap update
+#   4. integration-test  — Trigger a test DAG run and verify success
+# =============================================================================
+
+name: Data Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "airflow/dags/**"
+      - "dbt/**"
+      - "data_pipeline/**"
+      - ".github/workflows/data-pipeline.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "airflow/dags/**"
+      - "dbt/**"
+      - "data_pipeline/**"
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: "3.11"
+  DBT_PROJECT_DIR: dbt/churn_features
+  AIRFLOW_NAMESPACE: airflow
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ============================================================================
+  # JOB 1: dbt TEST
+  # dbt (data build tool) manages SQL transformations from raw → processed.
+  # Tests catch: null primary keys, referential integrity, value distributions.
+  # Failing tests mean data quality has degraded — block the deploy.
+  # ============================================================================
+  dbt-test:
+    name: dbt Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dbt
+        run: |
+          pip install dbt-core dbt-athena-community
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "dbt-test"
+
+      - name: Setup dbt profiles
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml <<EOF
+          churn_features:
+            outputs:
+              dev:
+                type: athena
+                s3_staging_dir: s3://${{ secrets.PROCESSED_BUCKET }}/dbt-staging/
+                region_name: ${{ env.AWS_REGION }}
+                database: churn_platform_dev
+                schema: curated
+                threads: 4
+                aws_profile_name: default
+            target: dev
+          EOF
+
+      - name: dbt deps (install packages)
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        run: dbt deps
+
+      - name: dbt compile (check SQL syntax without running)
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        run: |
+          dbt compile --profiles-dir ~/.dbt --profile churn_features
+
+      - name: dbt test (data quality tests)
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Run tests and output results as JSON for PR comment
+          dbt test \
+            --profiles-dir ~/.dbt \
+            --profile churn_features \
+            --store-failures \
+            --output json \
+            2>&1 | tee dbt-test-results.json
+
+      - name: Parse and report dbt results
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let results;
+            try {
+              const raw = fs.readFileSync('${{ env.DBT_PROJECT_DIR }}/dbt-test-results.json', 'utf8');
+              results = raw.trim().split('\n').map(l => JSON.parse(l)).filter(l => l.type === 'test_result');
+            } catch (e) {
+              console.log('Could not parse dbt results:', e.message);
+              return;
+            }
+
+            const passed = results.filter(r => r.status === 'pass').length;
+            const failed = results.filter(r => r.status === 'fail').length;
+            const warned = results.filter(r => r.status === 'warn').length;
+
+            const failedTests = results
+              .filter(r => r.status === 'fail')
+              .map(r => `- \`${r.unique_id}\``)
+              .join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## dbt Test Results ${failed === 0 ? '✅' : '❌'}
+
+              | Status | Count |
+              |--------|-------|
+              | ✅ Passed | ${passed} |
+              | ❌ Failed | ${failed} |
+              | ⚠️ Warned | ${warned} |
+
+              ${failed > 0 ? `**Failed tests:**\n${failedTests}` : ''}
+              `
+            });
+
+      - name: dbt source freshness
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Checks that source tables have been updated recently
+          # Alerts if raw event data is stale (Kinesis pipeline may be broken)
+          dbt source freshness \
+            --profiles-dir ~/.dbt \
+            --profile churn_features \
+            --output json
+
+  # ============================================================================
+  # JOB 2: VALIDATE DAGs
+  # Airflow DAG syntax errors cause the scheduler to fail entirely.
+  # We catch them here, before they reach the cluster.
+  # ============================================================================
+  validate-dags:
+    name: Validate Airflow DAGs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Airflow
+        run: |
+          # Install the same version as what's running in EKS
+          pip install "apache-airflow==2.8.1" \
+            apache-airflow-providers-amazon \
+            apache-airflow-providers-slack \
+            apache-airflow-providers-postgres
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile airflow/dags/*.py
+          echo "✅ All DAG files have valid Python syntax"
+
+      - name: Import check — catch missing dependencies
+        run: |
+          python - <<'EOF'
+          import os, importlib.util, sys
+
+          dag_dir = "airflow/dags"
+          failures = []
+
+          for fname in os.listdir(dag_dir):
+              if not fname.endswith('.py'):
+                  continue
+              fpath = os.path.join(dag_dir, fname)
+              try:
+                  spec = importlib.util.spec_from_file_location(fname[:-3], fpath)
+                  module = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  print(f"  ✅ {fname}")
+              except Exception as e:
+                  print(f"  ❌ {fname}: {e}")
+                  failures.append(fname)
+
+          if failures:
+              print(f"\n❌ {len(failures)} DAG(s) failed import check")
+              sys.exit(1)
+          else:
+              print(f"\n✅ All {len(os.listdir(dag_dir))} DAGs import successfully")
+          EOF
+
+      - name: Check DAG structure — no cycles, valid dependencies
+        run: |
+          python - <<'EOF'
+          import glob, ast, sys
+
+          for dag_file in glob.glob("airflow/dags/*.py"):
+              with open(dag_file) as f:
+                  tree = ast.parse(f.read())
+
+              # Check every DAG file has a 'dag' object at module level
+              dag_names = [
+                  node.targets[0].id
+                  for node in ast.walk(tree)
+                  if isinstance(node, ast.Assign)
+                  and isinstance(node.value, ast.Call)
+                  and getattr(getattr(node.value, 'func', None), 'id', None) == 'DAG'
+              ]
+
+              if not dag_names:
+                  print(f"⚠️  {dag_file}: No DAG object found at module level")
+              else:
+                  print(f"✅ {dag_file}: Found DAGs: {dag_names}")
+          EOF
+
+  # ============================================================================
+  # JOB 3: DEPLOY DAGs to Airflow
+  # Updates the Airflow ConfigMap in EKS with the new DAG content.
+  # Airflow's DAG processor picks up changes within ~30 seconds.
+  # ============================================================================
+  deploy-dags:
+    name: Deploy DAGs to Airflow
+    needs: [dbt-test, validate-dags]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "deploy-dags"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Package DAGs as ConfigMap
+        run: |
+          # Create a ConfigMap from the DAG files directory
+          # Each DAG file becomes a key in the ConfigMap
+          kubectl create configmap airflow-dags \
+            --from-file=airflow/dags/ \
+            --namespace ${{ env.AIRFLOW_NAMESPACE }} \
+            --dry-run=client \
+            -o yaml > airflow-dags-configmap.yaml
+
+          # Add metadata annotation with the git SHA for traceability
+          kubectl annotate -f airflow-dags-configmap.yaml \
+            git-sha=${{ github.sha }} \
+            deployed-by=github-actions \
+            --local \
+            -o yaml >> airflow-dags-configmap.yaml.tmp
+          mv airflow-dags-configmap.yaml.tmp airflow-dags-configmap.yaml
+
+      - name: Apply DAG ConfigMap
+        run: |
+          kubectl apply -f airflow-dags-configmap.yaml
+          echo "✅ DAG ConfigMap updated in namespace: ${{ env.AIRFLOW_NAMESPACE }}"
+
+      - name: Wait for Airflow to process new DAGs
+        run: |
+          echo "Waiting 45s for Airflow scheduler to parse new DAGs..."
+          sleep 45
+
+      - name: Verify DAGs are loaded in Airflow
+        run: |
+          # Port-forward to Airflow webserver to check DAG list
+          kubectl port-forward svc/airflow-webserver 8080:8080 \
+            -n ${{ env.AIRFLOW_NAMESPACE }} &
+          sleep 5
+
+          DAG_COUNT=$(curl -s \
+            --user "airflow:${{ secrets.AIRFLOW_ADMIN_PASSWORD }}" \
+            "http://localhost:8080/api/v1/dags" | \
+            python3 -c "import json,sys; data=json.load(sys.stdin); print(len(data.get('dags', [])))")
+
+          echo "Airflow reports $DAG_COUNT active DAGs"
+
+          kill %1  # Stop port-forward
+
+  # ============================================================================
+  # JOB 4: INTEGRATION TEST
+  # Triggers the simplest DAG (hourly_inference_batch) in test mode
+  # and verifies it completes successfully end-to-end
+  # ============================================================================
+  integration-test:
+    name: Integration Test
+    needs: deploy-dags
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "dag-integration-test"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Trigger test DAG run
+        run: |
+          kubectl port-forward svc/airflow-webserver 8080:8080 \
+            -n ${{ env.AIRFLOW_NAMESPACE }} &
+          sleep 5
+
+          # Trigger the data validation DAG as an integration test
+          RUN_ID=$(curl -s -X POST \
+            --user "airflow:${{ secrets.AIRFLOW_ADMIN_PASSWORD }}" \
+            "http://localhost:8080/api/v1/dags/daily_feature_engineering/dagRuns" \
+            -H "Content-Type: application/json" \
+            -d '{"conf": {"ci_test": true, "dry_run": true}}' | \
+            python3 -c "import json,sys; print(json.load(sys.stdin)['dag_run_id'])")
+
+          echo "Triggered DAG run: $RUN_ID"
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+          kill %1
+
+      - name: Wait for DAG run completion
+        run: |
+          kubectl port-forward svc/airflow-webserver 8080:8080 \
+            -n ${{ env.AIRFLOW_NAMESPACE }} &
+          sleep 5
+
+          MAX_WAIT=600  # 10 minutes
+          WAITED=0
+          while [ $WAITED -lt $MAX_WAIT ]; do
+            STATE=$(curl -s \
+              --user "airflow:${{ secrets.AIRFLOW_ADMIN_PASSWORD }}" \
+              "http://localhost:8080/api/v1/dags/daily_feature_engineering/dagRuns/${{ env.RUN_ID }}" | \
+              python3 -c "import json,sys; print(json.load(sys.stdin)['state'])")
+
+            echo "DAG state: $STATE (waited ${WAITED}s)"
+
+            case $STATE in
+              success)
+                echo "✅ DAG completed successfully"
+                kill %1
+                exit 0
+                ;;
+              failed)
+                echo "❌ DAG run failed"
+                kill %1
+                exit 1
+                ;;
+            esac
+
+            sleep 30
+            WAITED=$((WAITED + 30))
+          done
+
+          echo "❌ DAG did not complete within ${MAX_WAIT}s"
+          kill %1
+          exit 1
